@@ -1,5 +1,7 @@
-python-telegram-bot[job-queue]==20.7
-selenium==4.15.0
-undetected-chromedriver==3.5.4
-beautifulsoup4==4.12.2
-webdriver-manager==4.0.1
+python-telegram-bot==21.6
+python-dotenv==1.0.0
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.25
+alembic==1.13.1
+python-Levenshtein==0.25.0
+asyncpg==0.29.0
