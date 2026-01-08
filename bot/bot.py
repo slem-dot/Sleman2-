@@ -1,0 +1,68 @@
+"""Main bot class"""
+
+import logging
+import asyncio
+
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+
+from bot.config import BotConfig
+from bot.database import init_db, get_db
+from bot.handlers import commands, user as user_handlers, admin as admin_handlers, utils as utils_handlers
+
+logger = logging.getLogger(__name__)
+
+class IchancyBot:
+    def __init__(self):
+        self.config = BotConfig.from_env()
+        if not self.config.validate():
+            raise ValueError("Invalid configuration. Check env vars (BOT_TOKEN, SUPER_ADMIN_ID, REQUIRED_CHANNEL, SUPPORT_USERNAME, DATABASE_URL).")
+        self.application: Application | None = None
+
+    def run(self):
+        """Blocking runner for Railway/local."""
+        async def _bootstrap(app: Application):
+            # Attach config to bot_data for handlers
+            app.bot_data["required_channel"] = self.config.REQUIRED_CHANNEL
+            app.bot_data["support_username"] = self.config.SUPPORT_USERNAME
+            app.bot_data["min_topup"] = self.config.MIN_TOPUP
+            app.bot_data["min_withdraw"] = self.config.MIN_WITHDRAW
+            app.bot_data["super_admin_id"] = int(self.config.SUPER_ADMIN_ID)
+
+            # Init DB + ensure super admin role
+            await init_db(self.config)
+            async with (await get_db()).get_session() as session:
+                from bot.services.database import ensure_admin_user
+                await ensure_admin_user(session, int(self.config.SUPER_ADMIN_ID))
+
+        async def _shutdown(app: Application):
+            try:
+                db = await get_db()
+                await db.disconnect()
+            except Exception:
+                pass
+
+        self.application = (
+            Application.builder()
+            .token(self.config.BOT_TOKEN)
+            .post_init(_bootstrap)
+            .post_shutdown(_shutdown)
+            .build()
+        )
+
+        self._register_handlers()
+
+        logger.info("Bot is running (polling)...")
+        # run_polling is blocking and handles signal/idle internally
+        self.application.run_polling(allowed_updates=Application.ALL_TYPES)
+
+    def _register_handlers(self):
+        assert self.application is not None
+
+        self.application.add_handler(CommandHandler("start", commands.start))
+        self.application.add_handler(CommandHandler("admin", admin_handlers.admin_command))
+
+        # Messages (reply keyboard routing)
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_handlers.handle_message))
+
+        # Callback queries (generic utilities)
+        self.application.add_handler(CallbackQueryHandler(utils_handlers.handle_callback_query))
