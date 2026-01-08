@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+selenium==4.15.0
+undetected-chromedriver==3.5.4
+beautifulsoup4==4.12.2
+webdriver-manager==4.0.1
