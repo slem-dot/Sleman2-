@@ -954,7 +954,7 @@ async def manual_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 # Main
 # =========================
-async def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     topup_conv = ConversationHandler(
@@ -993,12 +993,17 @@ async def main():
 
     settings = get_settings()
     interval = settings.get("auto_verify_interval", 300)
-    app.job_queue.run_repeating(real_auto_verification_job, interval=interval, first=10)
+
+    # JobQueue موجود فقط إذا كان python-telegram-bot مثبتًا مع extra job-queue
+    if app.job_queue:
+        app.job_queue.run_repeating(real_auto_verification_job, interval=interval, first=10)
+    else:
+        logger.warning('⚠️ JobQueue غير متوفر. ثبّت: python-telegram-bot[job-queue] لتفعيل التحقق الدوري.')
 
     logger.info("🤖 بدء تشغيل البوت...")
-    await app.run_polling()
+    # run_polling يدير الـ event loop بنفسه، لذلك لا نستخدم asyncio.run هنا
+    app.run_polling()
 
 if __name__ == "__main__":
     _ensure_data_files()
-    verifier = RealSyriatelVerifier()
-    asyncio.run(main())
+    main()
