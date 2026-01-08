@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python311", "chromium", "chromedriver"]
-
-[start]
-cmd = "python main.py"
-
-[variables]
-NIXPACKS_PYTHON_VERSION = "3.11"
