@@ -1,49 +1,21 @@
-"""
-Utility callback handlers
-"""
-
+from __future__ import annotations
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from bot.utils.texts import ERR_GENERIC
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Generic callback query handler
-    """
-    query = update.callback_query
-    if not query:
-        return
+logger = logging.getLogger(__name__)
 
-    await query.answer()
+def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    admin_id = int(context.application.bot_data.get("super_admin_id", 0))
+    user = update.effective_user
+    return bool(user and int(user.id) == admin_id)
 
-    data = query.data or ""
-
-    # رجوع للقائمة الرئيسية
-    if data == "main:back":
-        from bot.keyboards.main import get_main_menu
-        await query.message.reply_text(
-            "🔙 تم الرجوع إلى القائمة الرئيسية",
-            reply_markup=get_main_menu()
-        )
-        return
-
-    # رجوع من الرصيد
-    if data == "balance:back":
-        from bot.keyboards.balance import get_balance_menu
-        await query.edit_message_text(
-            "اختر عملية:",
-            reply_markup=get_balance_menu()
-        )
-        return
-
-    # رجوع من حساب ايشانسي
-    if data == "eish:back":
-        from bot.keyboards.eish import get_eish_menu
-        await query.edit_message_text(
-            "👤 قسم حساب ايشانسي",
-            reply_markup=get_eish_menu()
-        )
-        return
-
-    # افتراضي
-    await query.edit_message_text("⚠️ خيار غير معروف")
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(ERR_GENERIC)
+    except Exception:
+        pass
