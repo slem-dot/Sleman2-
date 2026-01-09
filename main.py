@@ -1,2274 +1,2631 @@
-from __future__ import annotations
-
+# main.py
 import os
-import io
-import re
 import json
-import time
+import asyncio
+import logging
+import difflib
 import zipfile
 import tempfile
-import logging
-import asyncio
-import difflib
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-
-from dotenv import load_dotenv
+import shutil
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
+from enum import Enum
+from pathlib import Path
+import aiofiles
+import aiofiles.os
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    KeyboardButton,
+    ReplyKeyboardRemove,
+    Message,
+    User,
+    Chat,
+    InputFile
 )
-from telegram.constants import ChatMemberStatus
-from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden
-
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
-    filters,
+    filters
 )
+from telegram.constants import ParseMode
 
-# =========================
-# Config
-# =========================
+# ==================== ENV VARIABLES ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", 0))
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@broichancy")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+MIN_TOPUP = int(os.getenv("MIN_TOPUP", 15000))
+MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", 500))
+SYRIATEL_CODES = [code.strip() for code in os.getenv("SYRIATEL_CODES", "45191900,33333333,33333344").split(",")]
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-def _to_int(x: str | None, default: int) -> int:
-    try:
-        return int(x) if x is not None else default
-    except Exception:
-        return default
+# ==================== LOGGING ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_LEVEL)
+)
+logger = logging.getLogger(__name__)
 
-def _parse_codes(s: str) -> list[str]:
-    parts = [p.strip() for p in (s or "").split(",")]
-    return [p for p in parts if p]
+# ==================== PATHS ====================
+Path(DATA_DIR).mkdir(exist_ok=True)
+USERS_FILE = Path(DATA_DIR) / "users.json"
+ACCOUNTS_FILE = Path(DATA_DIR) / "accounts.json"
+PENDING_FILE = Path(DATA_DIR) / "pending.json"
+ADMINS_FILE = Path(DATA_DIR) / "admins.json"
+MAINTENANCE_FILE = Path(DATA_DIR) / "maintenance.json"
+BACKUP_DIR = Path(DATA_DIR) / "backups"
 
-@dataclass(frozen=True)
-class Config:
-    BOT_TOKEN: str
-    SUPER_ADMIN_ID: int
-    REQUIRED_CHANNEL: str
-    SUPPORT_USERNAME: str
-    DATA_DIR: str
-    MIN_TOPUP: int
-    MIN_WITHDRAW: int
-    SYRIATEL_CODES: list[str]
-    LOG_LEVEL: str
-
-    @staticmethod
-    def from_env() -> "Config":
-        return Config(
-            BOT_TOKEN=os.getenv("BOT_TOKEN", "").strip(),
-            SUPER_ADMIN_ID=_to_int(os.getenv("SUPER_ADMIN_ID"), 0),
-            REQUIRED_CHANNEL=os.getenv("REQUIRED_CHANNEL", "").strip(),
-            SUPPORT_USERNAME=os.getenv("SUPPORT_USERNAME", "@support").strip(),
-            DATA_DIR=(os.getenv("DATA_DIR", "data").strip() or "data"),
-            MIN_TOPUP=_to_int(os.getenv("MIN_TOPUP"), 15000),
-            MIN_WITHDRAW=_to_int(os.getenv("MIN_WITHDRAW"), 500),  # حسب طلبك: 500
-            SYRIATEL_CODES=_parse_codes(os.getenv("SYRIATEL_CODES", "45191900,33333333,33333344")),
-            LOG_LEVEL=(os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"),
-        )
-
-    def validate(self) -> Tuple[bool, str]:
-        if not self.BOT_TOKEN:
-            return False, "Missing BOT_TOKEN"
-        if not self.SUPER_ADMIN_ID:
-            return False, "Missing/invalid SUPER_ADMIN_ID"
-        if not self.REQUIRED_CHANNEL or not self.REQUIRED_CHANNEL.startswith("@"):
-            return False, "REQUIRED_CHANNEL must start with @"
-        if not self.SUPPORT_USERNAME or not self.SUPPORT_USERNAME.startswith("@"):
-            return False, "SUPPORT_USERNAME must start with @"
-        return True, "OK"
-
-def setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-logger = logging.getLogger("brobot")
-
-# =========================
-# Texts (smart + emojis)
-# =========================
-
-TXT = {
-    "welcome": "أهلاً بك 👋\nاختر الخدمة من الأزرار بالأسفل 👇",
-    "need_sub": "⚠️ لازم تشترك بالقناة أولاً حتى تقدر تستخدم البوت.",
-    "sub_ok": "✅ تم التحقق من الاشتراك! أهلاً وسهلاً 👋",
-    "sub_fail": "❌ ما زال الاشتراك غير ظاهر.\nاشترك بالقناة ثم اضغط (تحقق) 🔄",
-
-    "maintenance": "🔧 البوت الآن تحت الصيانة.\n⏳ جرّب لاحقاً من فضلك.",
-    "support": "🆘 للدعم والمساعدة:\n{support}",
-
-    "topup_methods_title": "➕ شحن رصيد البوت\nاختَر طريقة الشحن 👇",
-    "withdraw_methods_title": "➖ سحب رصيد من البوت\nاختَر طريقة السحب 👇",
-
-    "sham_support": "💳 حالياً {action} عبر **شام كاش** يتم فقط عبر الدعم.\n🆘 تواصل مع الدعم: {support}",
-
-    "sy_choose_code": "📲 تمام! حوّل يدويًا إلى أحد الأكواد التالية ثم اختر الكود من القائمة 👇",
-    "sy_ask_op": "🧾 أرسل رقم عملية التحويل (رقم العملية) 👇",
-    "sy_ask_amount_topup": "💰 أرسل مبلغ الشحن (لازم يكون ≥ {min}) 👇",
-    "sy_ask_receiver": "📩 أرسل رقم المستلم الذي سيتم إرسال المبلغ له 👇",
-    "sy_ask_amount_withdraw": "💰 أرسل مبلغ السحب (لازم يكون ≥ {min}) 👇",
-
-    "confirm_topup": "✅ تأكيد العملية\n\n📲 الطريقة: سيرياتيل كاش\n🔢 الكود: {code}\n🧾 رقم العملية: {op}\n💰 المبلغ: {amount}\n\nاضغط ✅ تأكيد لإرسال الطلب للأدمن.",
-    "confirm_withdraw": "✅ تأكيد العملية\n\n📲 الطريقة: سيرياتيل كاش\n📩 المستلم: {receiver}\n💰 المبلغ: {amount}\n\n⚠️ عند التأكيد سيتم حجز المبلغ مباشرة (Hold).",
-
-    "sent_admin": "✅ تم إرسال طلبك للأدمن بنجاح.\nرقم الطلب: #{id} 🧾",
-    "reserved": "✅ تم حجز المبلغ مباشرة (Hold) لحين موافقة الأدمن.\nرقم الطلب: #{id} 🧾",
-
-    "wallet": "💼 محفظتك:\n\n💰 الرصيد: {balance}\n⏳ المعلّق (Hold): {hold}",
-
-    "invalid": "⚠️ لم أفهم طلبك.\nاستخدم الأزرار بالأسفل 👇",
-    "back_main": "✅ رجعناك للقائمة الرئيسية 👇",
-    "cancelled": "❌ تم إلغاء العملية.",
-    "try_again": "⚠️ حدث شيء غير متوقع.\nجرّب مرة ثانية بعد قليل 🙏",
-
-    "no_pending_withdraw": "ℹ️ ما عندك أي طلب سحب معلّق حالياً.",
-    "withdraw_cancelled": "✅ تم إلغاء آخر طلب سحب معلّق وفكّ الحجز بنجاح 👌",
-
-    "ich_menu": "💼 حساب ايشانسي\nاختَر الخدمة 👇",
-    "ich_no_account": "⚠️ ما عندك حساب ايشانسي مربوط.\nابدأ بـ (إنشاء/استلام حساب) أولاً ✅",
-    "ich_deleted": "🗑️ تم حذف حساب ايشانسي من البوت بنجاح.",
-    "ich_delete_confirm": "🗑️ تأكيد حذف حساب ايشانسي؟\nهذا سيزيل الربط فقط من البوت.",
-    "ich_username_ask": "✍️ اكتب اسم المستخدم الذي تريده (تقريبياً) 👇",
-    "ich_suggest": "🔎 لقيت لك اقتراح مناسب من المخزون:\n\n👤 Username: `{u}`\n\nإذا مناسب اضغط ✅ تأكيد لاستلام الحساب.",
-    "ich_no_suggest": "❌ ما لقيت اسم قريب بالمخزون حالياً.\nجرّب اسم ثاني أو تواصل مع الدعم 🆘",
-    "ich_delivered": "✅ تم تسليم حساب ايشانسي بنجاح 🎉\n\n👤 Username: {u}\n🔑 Password: {p}\n\n📌 للنسخ السريع 👇",
-    "ich_copy_block": "```text\n{u}\n{p}\n```",
-    "ich_copy_line": "```text\n{u}:{p}\n```",
-
-    "ich_topup_ask": "💳 اكتب مبلغ شحن ايشانسي (لازم يكون مضاعف لـ 100) 👇",
-    "ich_withdraw_ask": "💸 اكتب مبلغ سحب ايشانسي (لازم يكون مضاعف لـ 100) 👇",
-
-    "ich_topup_confirm": "✅ تأكيد شحن ايشانسي\n\n👤 الحساب: `{u}`\n💳 مبلغ ايشانسي: {ia}\n💰 التكلفة من رصيد البوت: {cost}\n\nاضغط ✅ تأكيد لإرسال الطلب للأدمن.",
-    "ich_withdraw_confirm": "✅ تأكيد سحب من ايشانسي\n\n👤 الحساب: `{u}`\n💸 مبلغ ايشانسي: {ia}\n💰 سيضاف لرصيد البوت: {gain}\n\nاضغط ✅ تأكيد لإرسال الطلب للأدمن.",
-
-    "admin_only": "⛔ هذه الميزة للأدمن فقط.",
-    "admin_menu": "⚙️ لوحة الأدمن\nاختر خياراً 👇",
-    "admin_no_pending": "ℹ️ لا يوجد طلبات معلّقة حالياً.",
-    "admin_pending_title": "📌 الطلبات المعلقة:",
-    "admin_ask_user": "🔍 أرسل ID المستخدم (رقم) أو حوّل رسالة منه 👇",
-    "admin_user_not_found": "❌ لم يتم العثور على المستخدم.",
-    "admin_adjust_amount": "💳 أرسل قيمة التعديل (مثال: 1000 أو -500) 👇",
-    "admin_adjust_done": "✅ تم تعديل الرصيد بنجاح.",
-
-    "admin_edit_hint": "✏️ أرسل التعديل حسب النوع:\n"
-                      "• شحن سيرياتيل: code,op,amount\n"
-                      "• سحب سيرياتيل: receiver,amount\n"
-                      "• شحن ايشانسي: ichancy_amount\n"
-                      "• سحب ايشانسي: ichancy_amount\n",
-
-    "admin_order_updated": "✅ تم تحديث الطلب: {status}",
-
-    "admin_broadcast_prompt": "📣 أرسل الآن (نص / صورة / فيديو) ليتم إرساله لكل مستخدمي البوت 👇",
-    "admin_broadcast_done": "📣 تم الإرسال للجميع ✅\n\n✅ نجاح: {ok}\n❌ فشل: {bad}",
-
-    "admin_manage_assist": "👤 إدارة الأدمن المساعد\nاختر 👇",
-    "admin_add_assist_prompt": "➕ أرسل ID المساعد (رقم) أو حوّل رسالة منه 👇",
-    "admin_remove_assist_prompt": "➖ أرسل ID المساعد المراد حذفه 👇",
-    "admin_assist_added": "✅ تم إضافة أدمن مساعد.",
-    "admin_assist_removed": "✅ تم حذف الأدمن المساعد.",
-    "admin_assist_list": "👥 الأدمن المساعدين:\n{list}",
-
-    "inv_menu": "📦 مخزون ايشانسي\nاختر 👇",
-    "inv_add_prompt": "➕ أرسل الحساب بهذه الصيغة:\nusername,password",
-    "inv_added": "✅ تم إضافة الحساب للمخزون.",
-    "inv_list": "📦 المخزون:\nمتاح: {a}\nمحجوز/مسلّم: {b}",
-    "inv_delete_prompt": "🗑️ أرسل username المراد حذفه من المخزون 👇",
-    "inv_deleted": "✅ تم حذف الحساب من المخزون.",
-    "inv_not_found": "❌ لم يتم العثور على هذا الحساب بالمخزون.",
-
-    "backup_ready": "✅ تم إنشاء Backup بنجاح 📦\nاحتفظ به لاستخدامه في Restore.",
-    "restore_start": "🔧 تم تفعيل وضع الصيانة تلقائياً.\n📥 الآن أرسل ملف الـ ZIP الخاص بالنسخة الاحتياطية (Backup) 👇",
-    "restore_ok": "✅ تمت الاستعادة بنجاح 🎉\n🔧 وضع الصيانة ما زال مفعّل.\nعندما تتأكد من كل شيء، أوقف الصيانة من لوحة الأدمن.",
-    "restore_bad": "❌ ملف غير صالح.\nتأكد أنه ZIP ناتج من زر Backup.",
-
-    "maintenance_on": "🔧 تم تفعيل وضع الصيانة ✅",
-    "maintenance_off": "✅ تم إيقاف وضع الصيانة 👌",
-
-    "user_approved_24h": "✅ تمت الموافقة على طلبك #{id} 🎉\n⏳ أقصى مدة للتسليم: 24 ساعة.",
-    "user_rejected": "❌ تم رفض طلبك #{id}.",
-    "user_approved": "✅ تمت الموافقة على طلبك #{id} 🎉",
-
-    "insufficient": "❌ رصيدك لا يكفي لإتمام العملية.",
-    "must_multiple_100": "⚠️ لازم يكون المبلغ مضاعف لـ 100 (مثل 100، 200، 300...)",
+# ==================== LOCK MANAGEMENT ====================
+file_locks = {
+    USERS_FILE: asyncio.Lock(),
+    ACCOUNTS_FILE: asyncio.Lock(),
+    PENDING_FILE: asyncio.Lock(),
+    ADMINS_FILE: asyncio.Lock(),
+    MAINTENANCE_FILE: asyncio.Lock()
 }
 
-# =========================
-# Constants / callbacks
-# =========================
-
-OT_BOT_TOPUP = "bot_topup"
-OT_BOT_WITHDRAW = "bot_withdraw"
-OT_ICH_TOPUP = "ichancy_topup"
-OT_ICH_WITHDRAW = "ichancy_withdraw"
-OT_ICH_CREATE = "ichancy_create"
-
-ST_PENDING = "pending"
-ST_APPROVED = "approved"
-ST_REJECTED = "rejected"
-ST_CANCELLED = "cancelled"
-
-CB_CHECK_SUB = "chk_sub"
-
-CB_TOPUP_OK = "t_ok"
-CB_TOPUP_NO = "t_no"
-CB_WD_OK = "w_ok"
-CB_WD_NO = "w_no"
-
-CB_ICH_CREATE_OK = "ic_ok"
-CB_ICH_CREATE_NO = "ic_no"
-
-CB_ICH_DEL_OK = "id_ok"
-CB_ICH_DEL_NO = "id_no"
-
-CB_ICH_TOPUP_OK = "it_ok"
-CB_ICH_TOPUP_NO = "it_no"
-
-CB_ICH_WD_OK = "iw_ok"
-CB_ICH_WD_NO = "iw_no"
-
-CB_ORDER_APPROVE = "ord_ok"
-CB_ORDER_REJECT = "ord_no"
-CB_ORDER_EDIT = "ord_edit"
-
-# =========================
-# Helpers
-# =========================
-
-def now_ts() -> int:
-    return int(time.time())
-
-def safe_str(s: str | None, max_len: int = 256) -> str:
-    return (s or "").strip()[:max_len]
-
-def parse_int(text: str) -> Optional[int]:
-    try:
-        t = (text or "").strip().replace(",", "")
-        return int(t)
-    except Exception:
-        return None
-
-def normalize_username(u: str) -> str:
-    u = (u or "").strip().lower()
-    u = re.sub(r"[\s\-_\.]+", "", u)
-    return u
-
-def codeblock(text: str) -> str:
-    return f"```text\n{text}\n```"
-
-# =========================
-# JSON Storage
-# =========================
-
-class JSONStorage:
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self._locks: Dict[str, asyncio.Lock] = {}
-        os.makedirs(self.data_dir, exist_ok=True)
-
-        self._ensure("users.json", {})
-        self._ensure("wallet.json", {})
-        self._ensure("orders.json", {"next_id": 1, "orders": []})
-        self._ensure("logs.json", [])
-        self._ensure("settings.json", {"maintenance": False})
-        self._ensure("admins.json", {"assist_admin_ids": []})
-        self._ensure("ichancy_inventory.json", {"next_id": 1, "items": []})
-
-    def _path(self, fn: str) -> str:
-        return os.path.join(self.data_dir, fn)
-
-    def _lock(self, fn: str) -> asyncio.Lock:
-        if fn not in self._locks:
-            self._locks[fn] = asyncio.Lock()
-        return self._locks[fn]
-
-    def _ensure(self, fn: str, default: Any) -> None:
-        p = self._path(fn)
-        if not os.path.exists(p):
-            self._write_atomic_sync(fn, default)
-
-    async def read(self, fn: str, default: Any) -> Any:
-        async with self._lock(fn):
-            p = self._path(fn)
-            if not os.path.exists(p):
-                await self.write(fn, default)
-                return default
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                # backup corrupted and reset
-                try:
-                    os.replace(p, p + ".corrupted")
-                except Exception:
-                    pass
-                await self.write(fn, default)
-                return default
-
-    async def write(self, fn: str, data: Any) -> None:
-        async with self._lock(fn):
-            self._write_atomic_sync(fn, data)
-
-    def _write_atomic_sync(self, fn: str, data: Any) -> None:
-        p = self._path(fn)
-        os.makedirs(self.data_dir, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=fn + ".", suffix=".tmp", dir=self.data_dir)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, p)
-        finally:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-
-# =========================
-# Roles
-# =========================
-
-async def get_assist_admins(storage: JSONStorage) -> set[int]:
-    data = await storage.read("admins.json", {"assist_admin_ids": []})
-    ids = set(int(x) for x in data.get("assist_admin_ids", []) if isinstance(x, int) or str(x).isdigit())
-    return ids
-
-def is_super_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    cfg: Config = context.application.bot_data["cfg"]
-    u = update.effective_user
-    return bool(u and int(u.id) == int(cfg.SUPER_ADMIN_ID))
-
-async def is_admin_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_super_admin(update, context):
-        return True
-    u = update.effective_user
-    if not u:
-        return False
-    storage: JSONStorage = context.application.bot_data["storage"]
-    return int(u.id) in await get_assist_admins(storage)
-
-async def is_maintenance_on(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    storage: JSONStorage = context.application.bot_data["storage"]
-    s = await storage.read("settings.json", {"maintenance": False})
-    return bool(s.get("maintenance", False))
-
-# =========================
-# Subscription gate
-# =========================
-
-def _is_member_status(status: str) -> bool:
-    return status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.OWNER,
-        "member",
-        "administrator",
-        "creator",
-    )
-
-async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    cfg: Config = context.application.bot_data["cfg"]
-    user = update.effective_user
-    if not user:
-        return False
-    try:
-        cm = await context.bot.get_chat_member(chat_id=cfg.REQUIRED_CHANNEL, user_id=user.id)
-        return _is_member_status(getattr(cm, "status", ""))
-    except Exception:
-        return False
-
-def kb_subscribe(channel: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ اشترك بالقناة", url=f"https://t.me/{channel.lstrip('@')}")],
-            [InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data=CB_CHECK_SUB)],
-        ]
-    )
-
-async def send_sub_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = context.application.bot_data["cfg"]
-    msg = TXT["need_sub"]
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=kb_subscribe(cfg.REQUIRED_CHANNEL), disable_web_page_preview=True)
-    elif update.callback_query and update.callback_query.message:
-        await update.callback_query.message.reply_text(msg, reply_markup=kb_subscribe(cfg.REQUIRED_CHANNEL), disable_web_page_preview=True)
-
-# =========================
-# Guards
-# =========================
-
-async def user_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    # maintenance blocks normal users, allows admins
-    if await is_maintenance_on(context):
-        if await is_admin_any(update, context):
-            return True
-        if update.effective_message:
-            await update.effective_message.reply_text(TXT["maintenance"])
-        return False
-
-    # subscription gate for normal users (admins bypass)
-    if await is_admin_any(update, context):
-        return True
-
-    if not await is_subscribed(update, context):
-        await send_sub_gate(update, context)
-        return False
-
-    return True
-
-# =========================
-# Users / wallet / orders
-# =========================
-
-async def create_or_update_user(storage: JSONStorage, tg_user) -> None:
-    users = await storage.read("users.json", {})
-    uid = str(tg_user.id)
-    old = users.get(uid, {})
-    users[uid] = {
-        "id": tg_user.id,
-        "username": tg_user.username,
-        "first_name": tg_user.first_name,
-        "last_name": tg_user.last_name,
-        "created_at": old.get("created_at") or now_ts(),
-        "updated_at": now_ts(),
-        "ichancy": old.get("ichancy"),
-    }
-    await storage.write("users.json", users)
-
-async def get_user(storage: JSONStorage, user_id: int) -> Optional[dict]:
-    users = await storage.read("users.json", {})
-    return users.get(str(user_id))
-
-async def set_user_ichancy(storage: JSONStorage, user_id: int, username: str, password: str) -> None:
-    users = await storage.read("users.json", {})
-    uid = str(user_id)
-    if uid not in users:
-        users[uid] = {"id": user_id, "created_at": now_ts()}
-    users[uid]["ichancy"] = {"username": username, "password": password, "updated_at": now_ts()}
-    users[uid]["updated_at"] = now_ts()
-    await storage.write("users.json", users)
-
-async def delete_user_ichancy(storage: JSONStorage, user_id: int) -> bool:
-    users = await storage.read("users.json", {})
-    uid = str(user_id)
-    if uid in users and users[uid].get("ichancy"):
-        users[uid]["ichancy"] = None
-        users[uid]["updated_at"] = now_ts()
-        await storage.write("users.json", users)
-        return True
-    return False
-
-async def get_wallet(storage: JSONStorage, user_id: int) -> dict:
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    if uid not in wallet:
-        wallet[uid] = {"balance": 0, "hold": 0}
-        await storage.write("wallet.json", wallet)
-    w = wallet[uid]
-    w["balance"] = max(0, int(w.get("balance", 0)))
-    w["hold"] = max(0, int(w.get("hold", 0)))
-    return w
-
-async def add_balance(storage: JSONStorage, user_id: int, amount: int) -> dict:
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    w = wallet.get(uid, {"balance": 0, "hold": 0})
-    w["balance"] = max(0, int(w.get("balance", 0)) + int(amount))
-    w["hold"] = max(0, int(w.get("hold", 0)))
-    wallet[uid] = w
-    await storage.write("wallet.json", wallet)
-    return w
-
-async def deduct_balance(storage: JSONStorage, user_id: int, amount: int) -> Tuple[bool, dict]:
-    if amount <= 0:
-        return False, await get_wallet(storage, user_id)
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    w = wallet.get(uid, {"balance": 0, "hold": 0})
-    bal = int(w.get("balance", 0))
-    if bal < amount:
-        return False, {"balance": bal, "hold": int(w.get("hold", 0))}
-    bal -= amount
-    w["balance"] = max(0, bal)
-    wallet[uid] = w
-    await storage.write("wallet.json", wallet)
-    return True, w
-
-async def reserve_withdraw(storage: JSONStorage, user_id: int, amount: int) -> Tuple[bool, dict]:
-    if amount <= 0:
-        return False, await get_wallet(storage, user_id)
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    w = wallet.get(uid, {"balance": 0, "hold": 0})
-    bal = int(w.get("balance", 0))
-    hold = int(w.get("hold", 0))
-    if bal < amount:
-        return False, {"balance": bal, "hold": hold}
-    bal -= amount
-    hold += amount
-    wallet[uid] = {"balance": max(0, bal), "hold": max(0, hold)}
-    await storage.write("wallet.json", wallet)
-    return True, wallet[uid]
-
-async def release_hold(storage: JSONStorage, user_id: int, amount: int) -> dict:
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    w = wallet.get(uid, {"balance": 0, "hold": 0})
-    bal = int(w.get("balance", 0))
-    hold = int(w.get("hold", 0))
-    hold = max(0, hold - amount)
-    bal = max(0, bal + amount)
-    wallet[uid] = {"balance": bal, "hold": hold}
-    await storage.write("wallet.json", wallet)
-    return wallet[uid]
-
-async def finalize_withdraw(storage: JSONStorage, user_id: int, amount: int) -> dict:
-    wallet = await storage.read("wallet.json", {})
-    uid = str(user_id)
-    w = wallet.get(uid, {"balance": 0, "hold": 0})
-    hold = int(w.get("hold", 0))
-    hold = max(0, hold - amount)
-    w["hold"] = hold
-    wallet[uid] = w
-    await storage.write("wallet.json", wallet)
-    return w
-
-async def create_order(storage: JSONStorage, order_type: str, user_id: int, data: dict, status: str = ST_PENDING) -> dict:
-    obj = await storage.read("orders.json", {"next_id": 1, "orders": []})
-    oid = int(obj.get("next_id", 1))
-    order = {
-        "id": oid,
-        "type": order_type,
-        "status": status,
-        "user_id": int(user_id),
-        "data": data,
-        "created_at": now_ts(),
-        "updated_at": now_ts(),
-    }
-    obj["orders"] = list(obj.get("orders", [])) + [order]
-    obj["next_id"] = oid + 1
-    await storage.write("orders.json", obj)
-    return order
-
-async def get_order(storage: JSONStorage, order_id: int) -> Optional[dict]:
-    obj = await storage.read("orders.json", {"next_id": 1, "orders": []})
-    for o in obj.get("orders", []):
-        if int(o.get("id", 0)) == int(order_id):
-            return o
-    return None
-
-async def update_order(storage: JSONStorage, order_id: int, patch: dict) -> Optional[dict]:
-    obj = await storage.read("orders.json", {"next_id": 1, "orders": []})
-    orders = list(obj.get("orders", []))
-    updated = None
-    for i, o in enumerate(orders):
-        if int(o.get("id", 0)) == int(order_id):
-            o.update(patch)
-            o["updated_at"] = now_ts()
-            orders[i] = o
-            updated = o
-            break
-    if updated:
-        obj["orders"] = orders
-        await storage.write("orders.json", obj)
-    return updated
-
-async def list_pending(storage: JSONStorage, limit: int = 25) -> list[dict]:
-    obj = await storage.read("orders.json", {"next_id": 1, "orders": []})
-    orders = list(obj.get("orders", []))
-    pending = [o for o in orders if o.get("status") == ST_PENDING]
-    pending.sort(key=lambda x: int(x.get("id", 0)))
-    return pending[:limit]
-
-async def last_pending_withdraw_order(storage: JSONStorage, user_id: int) -> Optional[dict]:
-    obj = await storage.read("orders.json", {"next_id": 1, "orders": []})
-    orders = [o for o in obj.get("orders", []) if int(o.get("user_id", 0)) == int(user_id)]
-    orders = [o for o in orders if o.get("type") == OT_BOT_WITHDRAW and o.get("status") == ST_PENDING]
-    if not orders:
-        return None
-    orders.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
-    return orders[0]
-
-# =========================
-# Ichancy inventory
-# =========================
-
-async def inv_stats(storage: JSONStorage) -> tuple[int, int]:
-    inv = await storage.read("ichancy_inventory.json", {"next_id": 1, "items": []})
-    items = inv.get("items", [])
-    a = sum(1 for it in items if it.get("status") == "available")
-    b = sum(1 for it in items if it.get("status") != "available")
-    return a, b
-
-async def inv_add(storage: JSONStorage, username: str, password: str) -> dict:
-    inv = await storage.read("ichancy_inventory.json", {"next_id": 1, "items": []})
-    iid = int(inv.get("next_id", 1))
-    item = {
-        "id": iid,
-        "username": username,
-        "password": password,
-        "status": "available",
-        "assigned_to": None,
-        "assigned_at": None,
-        "created_at": now_ts(),
-    }
-    inv["items"] = list(inv.get("items", [])) + [item]
-    inv["next_id"] = iid + 1
-    await storage.write("ichancy_inventory.json", inv)
-    return item
-
-async def inv_delete_by_username(storage: JSONStorage, username: str) -> bool:
-    inv = await storage.read("ichancy_inventory.json", {"next_id": 1, "items": []})
-    items = list(inv.get("items", []))
-    new_items = [it for it in items if it.get("username") != username]
-    if len(new_items) == len(items):
-        return False
-    inv["items"] = new_items
-    await storage.write("ichancy_inventory.json", inv)
-    return True
-
-async def inv_find_best_match(storage: JSONStorage, desired: str) -> Optional[dict]:
-    inv = await storage.read("ichancy_inventory.json", {"next_id": 1, "items": []})
-    items = [it for it in inv.get("items", []) if it.get("status") == "available"]
-    if not items:
-        return None
-
-    desired_n = normalize_username(desired)
-    # exact match
-    for it in items:
-        if normalize_username(it.get("username", "")) == desired_n:
-            return it
-
-    choices = [(it, normalize_username(it.get("username", ""))) for it in items]
-    usernames_norm = [u for (_, u) in choices]
-    best = difflib.get_close_matches(desired_n, usernames_norm, n=1, cutoff=0.55)
-    if not best:
-        return None
-    best_norm = best[0]
-    for it, un in choices:
-        if un == best_norm:
-            return it
-    return None
-
-async def inv_assign(storage: JSONStorage, item_id: int, user_id: int) -> Optional[dict]:
-    inv = await storage.read("ichancy_inventory.json", {"next_id": 1, "items": []})
-    items = list(inv.get("items", []))
-    updated = None
-    for i, it in enumerate(items):
-        if int(it.get("id", 0)) == int(item_id):
-            if it.get("status") != "available":
-                return None
-            it["status"] = "assigned"
-            it["assigned_to"] = int(user_id)
-            it["assigned_at"] = now_ts()
-            items[i] = it
-            updated = it
-            break
-    if updated:
-        inv["items"] = items
-        await storage.write("ichancy_inventory.json", inv)
-    return updated
-
-# =========================
-# Keyboards
-# =========================
-
-def kb_user_main() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("💼 حساب ايشانسي"), KeyboardButton("💰 محفظتي")],
-            [KeyboardButton("➕ شحن رصيد البوت"), KeyboardButton("➖ سحب رصيد من البوت")],
-            [KeyboardButton("🧾 إلغاء آخر طلب سحب")],
-            [KeyboardButton("🆘 دعم")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_methods() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("💳 شام كاش"), KeyboardButton("📲 سيرياتيل كاش")],
-            [KeyboardButton("⬅️ رجوع")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_codes(codes: list[str]) -> ReplyKeyboardMarkup:
-    rows = []
-    row = []
-    for c in codes:
-        row.append(KeyboardButton(str(c)))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([KeyboardButton("⬅️ رجوع")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-def kb_back_only() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[KeyboardButton("⬅️ رجوع")]], resize_keyboard=True)
-
-def kb_confirm_inline(ok_cb: str, no_cb: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأكيد", callback_data=ok_cb),
-                                 InlineKeyboardButton("❌ إلغاء", callback_data=no_cb)]])
-
-def kb_ichancy() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("✅ إنشاء/استلام حساب ايشانسي")],
-            [KeyboardButton("➕ شحن حساب ايشانسي"), KeyboardButton("➖ سحب من حساب ايشانسي")],
-            [KeyboardButton("🗑️ حذف حساب ايشانسي")],
-            [KeyboardButton("⬅️ رجوع")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_admin() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📌 الطلبات المعلقة"), KeyboardButton("🔍 بحث مستخدم")],
-            [KeyboardButton("💳 تعديل رصيد (Super)"), KeyboardButton("📦 مخزون ايشانسي (Super)")],
-            [KeyboardButton("📣 رسالة جماعية (Super)"), KeyboardButton("👤 أدمن مساعد (Super)")],
-            [KeyboardButton("💾 Backup (Super)"), KeyboardButton("♻️ Restore (Super)")],
-            [KeyboardButton("🔧 صيانة ON/OFF (Super)")],
-            [KeyboardButton("⬅️ رجوع")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_admin_assist() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("➕ إضافة مساعد"), KeyboardButton("➖ حذف مساعد")],
-            [KeyboardButton("📋 عرض المساعدين")],
-            [KeyboardButton("⬅️ رجوع")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_inventory() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("➕ إضافة حساب"), KeyboardButton("📋 إحصائيات")],
-            [KeyboardButton("🗑️ حذف حساب")],
-            [KeyboardButton("⬅️ رجوع")],
-        ],
-        resize_keyboard=True,
-    )
-
-def kb_order_actions(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✏️ تعديل", callback_data=f"{CB_ORDER_EDIT}:{order_id}"),
-            InlineKeyboardButton("✅ قبول", callback_data=f"{CB_ORDER_APPROVE}:{order_id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"{CB_ORDER_REJECT}:{order_id}"),
-        ]]
-    )
-
-# =========================
-# Formatting / notifications
-# =========================
-
-def fmt_order(order: dict) -> str:
-    t = order.get("type")
-    s = order.get("status")
-    uid = order.get("user_id")
-    data = order.get("data", {}) or {}
-
-    base = f"🧾 الطلب #{order.get('id')} | {t} | {s}\n👤 user_id: {uid}\n"
-
-    if t == OT_BOT_TOPUP:
-        return base + f"📲 سيرياتيل شحن\n🔢 code: `{data.get('code')}`\n🧾 op: `{data.get('operation_no')}`\n💰 amount: {data.get('amount')}"
-    if t == OT_BOT_WITHDRAW:
-        return base + f"📲 سيرياتيل سحب\n📩 receiver: `{data.get('receiver_no')}`\n💰 amount: {data.get('amount')}"
-    if t == OT_ICH_TOPUP:
-        return base + f"💼 ايشانسي شحن\n👤 ichancy: `{data.get('ichancy_username')}`\n💳 ichancy_amount: {data.get('ichancy_amount')}\n💰 cost(bot): {data.get('bot_cost')}"
-    if t == OT_ICH_WITHDRAW:
-        return base + f"💼 ايشانسي سحب\n👤 ichancy: `{data.get('ichancy_username')}`\n💸 ichancy_amount: {data.get('ichancy_amount')}\n💰 gain(bot): {data.get('bot_gain')}"
-    if t == OT_ICH_CREATE:
-        return base + f"✅ تسليم حساب ايشانسي (من المخزون)\n👤 ichancy: `{data.get('ichancy_username')}`\n📦 inv_id: {data.get('inv_id')}"
-    return base + f"data: {data}"
-
-async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
-    cfg: Config = context.application.bot_data["cfg"]
-    storage: JSONStorage = context.application.bot_data["storage"]
-    admins = set([cfg.SUPER_ADMIN_ID]) | await get_assist_admins(storage)
-    for aid in admins:
-        try:
-            await context.bot.send_message(chat_id=aid, text=text, reply_markup=reply_markup)
-        except Exception:
-            continue
-
-async def safe_sleep_for_flood(e: Exception) -> None:
-    if isinstance(e, RetryAfter):
-        await asyncio.sleep(int(getattr(e, "retry_after", 2)) + 1)
-    else:
-        await asyncio.sleep(1)
-
-# =========================
-# States
-# =========================
-
-(
-    ST_TOPUP_METHOD,
-    ST_TOPUP_CODE,
-    ST_TOPUP_OP,
-    ST_TOPUP_AMOUNT,
-    ST_TOPUP_CONFIRM,
-
-    ST_WD_METHOD,
-    ST_WD_RECEIVER,
-    ST_WD_AMOUNT,
-    ST_WD_CONFIRM,
-
-    ST_ICH_MENU,
-    ST_ICH_CREATE_DESIRED,
-    ST_ICH_CREATE_CONFIRM,
-    ST_ICH_TOPUP_AMOUNT,
-    ST_ICH_TOPUP_CONFIRM,
-    ST_ICH_WD_AMOUNT,
-    ST_ICH_WD_CONFIRM,
-    ST_ICH_DEL_CONFIRM,
-
-    AD_MENU,
-    AD_FIND_USER,
-    AD_ADJUST_USER,
-    AD_ADJUST_AMOUNT,
-
-    AD_INV_MENU,
-    AD_INV_ADD,
-    AD_INV_DELETE,
-
-    AD_AS_MENU,
-    AD_AS_ADD,
-    AD_AS_REMOVE,
-
-    AD_BROADCAST,
-    AD_RESTORE_WAIT,
-) = range(29)
-
-# =========================
-# /start + subscription button
-# =========================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
-        return
-    storage: JSONStorage = context.application.bot_data["storage"]
-    await create_or_update_user(storage, update.effective_user)
-
-    # maintenance blocks normal users
-    if await is_maintenance_on(context) and not await is_admin_any(update, context):
-        await update.message.reply_text(TXT["maintenance"])
-        return
-
-    if not await is_subscribed(update, context) and not await is_admin_any(update, context):
-        await send_sub_gate(update, context)
-        return
-
-    await update.message.reply_text(TXT["welcome"], reply_markup=kb_user_main())
-
-async def cb_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-
-    if await is_maintenance_on(context) and not await is_admin_any(update, context):
-        await q.message.reply_text(TXT["maintenance"])
-        return
-
-    if await is_subscribed(update, context):
-        await q.message.reply_text(TXT["sub_ok"], reply_markup=kb_user_main())
-    else:
-        cfg: Config = context.application.bot_data["cfg"]
-        await q.message.reply_text(TXT["sub_fail"], reply_markup=kb_subscribe(cfg.REQUIRED_CHANNEL))
-
-# =========================
-# User entry router
-# =========================
-
-async def user_entry_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    storage: JSONStorage = context.application.bot_data["storage"]
-    text = (update.message.text or "").strip()
-
-    if text == "💰 محفظتي":
-        w = await get_wallet(storage, update.effective_user.id)
-        await update.message.reply_text(TXT["wallet"].format(balance=w["balance"], hold=w["hold"]), reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "🆘 دعم":
-        await update.message.reply_text(TXT["support"].format(support=cfg.SUPPORT_USERNAME), reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "➕ شحن رصيد البوت":
-        context.user_data.clear()
-        await update.message.reply_text(TXT["topup_methods_title"], reply_markup=kb_methods())
-        return ST_TOPUP_METHOD
-
-    if text == "➖ سحب رصيد من البوت":
-        context.user_data.clear()
-        await update.message.reply_text(TXT["withdraw_methods_title"], reply_markup=kb_methods())
-        return ST_WD_METHOD
-
-    if text == "🧾 إلغاء آخر طلب سحب":
-        last = await last_pending_withdraw_order(storage, update.effective_user.id)
-        if not last:
-            await update.message.reply_text(TXT["no_pending_withdraw"], reply_markup=kb_user_main())
-            return ConversationHandler.END
-        amt = int((last.get("data") or {}).get("amount", 0))
-        await update_order(storage, int(last["id"]), {"status": ST_CANCELLED})
-        await release_hold(storage, update.effective_user.id, amt)
-        await update.message.reply_text(TXT["withdraw_cancelled"], reply_markup=kb_user_main())
-        await notify_admins(context, f"🧾 تم إلغاء طلب سحب من المستخدم {update.effective_user.id}\nطلب #{last['id']} (كان Pending).")
-        return ConversationHandler.END
-
-    if text == "💼 حساب ايشانسي":
-        await update.message.reply_text(TXT["ich_menu"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    await update.message.reply_text(TXT["invalid"], reply_markup=kb_user_main())
-    return ConversationHandler.END
-
-# =========================
-# Topup flow
-# =========================
-
-async def topup_choose_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["back_main"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "💳 شام كاش":
-        await update.message.reply_text(TXT["sham_support"].format(action="الشحن", support=cfg.SUPPORT_USERNAME),
-                                        reply_markup=kb_user_main(), disable_web_page_preview=True)
-        return ConversationHandler.END
-
-    if text == "📲 سيرياتيل كاش":
-        codes = cfg.SYRIATEL_CODES or ["45191900", "33333333", "33333344"]
-        await update.message.reply_text(TXT["sy_choose_code"], reply_markup=kb_codes(codes))
-        return ST_TOPUP_CODE
-
-    await update.message.reply_text("⚠️ اختَر طريقة من الأزرار 👇", reply_markup=kb_methods())
-    return ST_TOPUP_METHOD
-
-async def topup_choose_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["topup_methods_title"], reply_markup=kb_methods())
-        return ST_TOPUP_METHOD
-
-    codes = set(cfg.SYRIATEL_CODES or [])
-    if text not in codes:
-        await update.message.reply_text("⚠️ اختَر كود من القائمة فقط 👇", reply_markup=kb_codes(list(codes)))
-        return ST_TOPUP_CODE
-
-    context.user_data["topup_code"] = text
-    await update.message.reply_text(TXT["sy_ask_op"], reply_markup=kb_back_only())
-    return ST_TOPUP_OP
-
-async def topup_get_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["sy_choose_code"], reply_markup=kb_codes(cfg.SYRIATEL_CODES))
-        return ST_TOPUP_CODE
-
-    op = safe_str(text, 64)
-    if len(op) < 3:
-        await update.message.reply_text("⚠️ رقم العملية غير صحيح. أعد الإرسال 👇", reply_markup=kb_back_only())
-        return ST_TOPUP_OP
-
-    context.user_data["topup_op"] = op
-    await update.message.reply_text(TXT["sy_ask_amount_topup"].format(min=cfg.MIN_TOPUP), reply_markup=kb_back_only())
-    return ST_TOPUP_AMOUNT
-
-async def topup_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["sy_ask_op"], reply_markup=kb_back_only())
-        return ST_TOPUP_OP
-
-    amount = parse_int(text)
-    if amount is None or amount < cfg.MIN_TOPUP:
-        await update.message.reply_text(f"⚠️ مبلغ غير صحيح.\nلازم يكون ≥ {cfg.MIN_TOPUP} 👇", reply_markup=kb_back_only())
-        return ST_TOPUP_AMOUNT
-
-    context.user_data["topup_amount"] = int(amount)
-
-    summary = TXT["confirm_topup"].format(
-        code=context.user_data["topup_code"],
-        op=context.user_data["topup_op"],
-        amount=context.user_data["topup_amount"],
-    )
-    await update.message.reply_text(summary, reply_markup=kb_confirm_inline(CB_TOPUP_OK, CB_TOPUP_NO))
-    return ST_TOPUP_CONFIRM
-
-async def cb_topup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_TOPUP_NO:
-        context.user_data.clear()
-        await q.message.reply_text(TXT["cancelled"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    user_id = q.from_user.id
-
-    code = context.user_data.get("topup_code")
-    op = context.user_data.get("topup_op")
-    amt = context.user_data.get("topup_amount")
-    if not (code and op and amt):
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ بيانات ناقصة. أعد العملية 🙏", reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    order = await create_order(storage, OT_BOT_TOPUP, user_id,
-                               {"method": "syriatel_cash", "code": code, "operation_no": op, "amount": int(amt)},
-                               status=ST_PENDING)
-
-    context.user_data.clear()
-    await q.message.reply_text(TXT["sent_admin"].format(id=order["id"]), reply_markup=kb_user_main())
-    await notify_admins(context, fmt_order(order), reply_markup=kb_order_actions(order["id"]))
-    return ConversationHandler.END
-
-# =========================
-# Withdraw flow
-# =========================
-
-async def wd_choose_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["back_main"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "💳 شام كاش":
-        await update.message.reply_text(TXT["sham_support"].format(action="السحب", support=cfg.SUPPORT_USERNAME),
-                                        reply_markup=kb_user_main(), disable_web_page_preview=True)
-        return ConversationHandler.END
-
-    if text == "📲 سيرياتيل كاش":
-        await update.message.reply_text(TXT["sy_ask_receiver"], reply_markup=kb_back_only())
-        return ST_WD_RECEIVER
-
-    await update.message.reply_text("⚠️ اختَر طريقة من الأزرار 👇", reply_markup=kb_methods())
-    return ST_WD_METHOD
-
-async def wd_get_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["withdraw_methods_title"], reply_markup=kb_methods())
-        return ST_WD_METHOD
-
-    receiver = safe_str(text, 64)
-    if len(receiver) < 3:
-        await update.message.reply_text("⚠️ رقم المستلم غير صحيح. أعد الإرسال 👇", reply_markup=kb_back_only())
-        return ST_WD_RECEIVER
-
-    context.user_data["wd_receiver"] = receiver
-    await update.message.reply_text(TXT["sy_ask_amount_withdraw"].format(min=cfg.MIN_WITHDRAW), reply_markup=kb_back_only())
-    return ST_WD_AMOUNT
-
-async def wd_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    cfg: Config = context.application.bot_data["cfg"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["sy_ask_receiver"], reply_markup=kb_back_only())
-        return ST_WD_RECEIVER
-
-    amount = parse_int(text)
-    if amount is None or amount < cfg.MIN_WITHDRAW:
-        await update.message.reply_text(f"⚠️ مبلغ غير صحيح.\nلازم يكون ≥ {cfg.MIN_WITHDRAW} 👇", reply_markup=kb_back_only())
-        return ST_WD_AMOUNT
-
-    context.user_data["wd_amount"] = int(amount)
-
-    summary = TXT["confirm_withdraw"].format(receiver=context.user_data["wd_receiver"], amount=context.user_data["wd_amount"])
-    await update.message.reply_text(summary, reply_markup=kb_confirm_inline(CB_WD_OK, CB_WD_NO))
-    return ST_WD_CONFIRM
-
-async def cb_withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_WD_NO:
-        context.user_data.clear()
-        await q.message.reply_text(TXT["cancelled"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    user_id = q.from_user.id
-
-    receiver = context.user_data.get("wd_receiver")
-    amt = context.user_data.get("wd_amount")
-    if not (receiver and amt):
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ بيانات ناقصة. أعد المحاولة 🙏", reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    ok, _w = await reserve_withdraw(storage, user_id, int(amt))
-    if not ok:
-        context.user_data.clear()
-        await q.message.reply_text(TXT["insufficient"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    order = await create_order(storage, OT_BOT_WITHDRAW, user_id,
-                               {"method": "syriatel_cash", "receiver_no": receiver, "amount": int(amt)},
-                               status=ST_PENDING)
-
-    context.user_data.clear()
-    await q.message.reply_text(TXT["reserved"].format(id=order["id"]), reply_markup=kb_user_main())
-    await notify_admins(context, fmt_order(order), reply_markup=kb_order_actions(order["id"]))
-    return ConversationHandler.END
-
-# =========================
-# Ichancy menu + flows
-# =========================
-
-async def ich_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["back_main"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "✅ إنشاء/استلام حساب ايشانسي":
-        u = await get_user(storage, update.effective_user.id)
-        if u and u.get("ichancy"):
-            await update.message.reply_text("ℹ️ عندك حساب ايشانسي مربوط بالفعل.\nإذا بدك تبدله احذف الحساب أولاً 🗑️",
-                                            reply_markup=kb_ichancy())
-            return ST_ICH_MENU
-        await update.message.reply_text(TXT["ich_username_ask"], reply_markup=kb_back_only())
-        return ST_ICH_CREATE_DESIRED
-
-    if text == "➕ شحن حساب ايشانسي":
-        u = await get_user(storage, update.effective_user.id)
-        if not u or not u.get("ichancy"):
-            await update.message.reply_text(TXT["ich_no_account"], reply_markup=kb_ichancy())
-            return ST_ICH_MENU
-        await update.message.reply_text(TXT["ich_topup_ask"], reply_markup=kb_back_only())
-        return ST_ICH_TOPUP_AMOUNT
-
-    if text == "➖ سحب من حساب ايشانسي":
-        u = await get_user(storage, update.effective_user.id)
-        if not u or not u.get("ichancy"):
-            await update.message.reply_text(TXT["ich_no_account"], reply_markup=kb_ichancy())
-            return ST_ICH_MENU
-        await update.message.reply_text(TXT["ich_withdraw_ask"], reply_markup=kb_back_only())
-        return ST_ICH_WD_AMOUNT
-
-    if text == "🗑️ حذف حساب ايشانسي":
-        u = await get_user(storage, update.effective_user.id)
-        if not u or not u.get("ichancy"):
-            await update.message.reply_text("ℹ️ ما عندك حساب ايشانسي محفوظ أصلاً.", reply_markup=kb_ichancy())
-            return ST_ICH_MENU
-        ich_u = (u.get("ichancy") or {}).get("username")
-        await update.message.reply_text(
-            TXT["ich_delete_confirm"] + f"\n\n👤 الحساب: `{ich_u}`",
-            reply_markup=kb_confirm_inline(CB_ICH_DEL_OK, CB_ICH_DEL_NO),
+# ==================== DATA STRUCTURES ====================
+class UserData:
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.balance = 0.0
+        self.hold = 0.0
+        self.eshansy_account = None
+        self.eshansy_balance = 0
+        self.subscribed = False
+        self.is_admin = False
+        self.is_super_admin = False
+        self.created_at = datetime.now().isoformat()
+        
+    def to_dict(self):
+        return {
+            "user_id": self.user_id,
+            "balance": self.balance,
+            "hold": self.hold,
+            "eshansy_account": self.eshansy_account,
+            "eshansy_balance": self.eshansy_balance,
+            "subscribed": self.subscribed,
+            "is_admin": self.is_admin,
+            "is_super_admin": self.is_super_admin,
+            "created_at": self.created_at
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        user = cls(data["user_id"])
+        user.balance = data.get("balance", 0.0)
+        user.hold = data.get("hold", 0.0)
+        user.eshansy_account = data.get("eshansy_account")
+        user.eshansy_balance = data.get("eshansy_balance", 0)
+        user.subscribed = data.get("subscribed", False)
+        user.is_admin = data.get("is_admin", False)
+        user.is_super_admin = data.get("is_super_admin", False)
+        user.created_at = data.get("created_at", datetime.now().isoformat())
+        return user
+
+class EshansyAccount:
+    def __init__(self, username: str, password: str):
+        self.username = username
+        self.password = password
+        self.assigned_to = None
+        self.assigned_at = None
+        self.created_at = datetime.now().isoformat()
+        
+    def to_dict(self):
+        return {
+            "username": self.username,
+            "password": self.password,
+            "assigned_to": self.assigned_to,
+            "assigned_at": self.assigned_at,
+            "created_at": self.created_at
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        acc = cls(data["username"], data["password"])
+        acc.assigned_to = data.get("assigned_to")
+        acc.assigned_at = data.get("assigned_at")
+        acc.created_at = data.get("created_at", datetime.now().isoformat())
+        return acc
+
+class PendingRequest:
+    def __init__(self, request_id: str, user_id: int, req_type: str, data: dict):
+        self.request_id = request_id
+        self.user_id = user_id
+        self.type = req_type  # "topup", "withdraw", "eshansy_topup", "eshansy_withdraw"
+        self.data = data
+        self.status = "pending"
+        self.created_at = datetime.now().isoformat()
+        self.handled_by = None
+        self.handled_at = None
+        
+    def to_dict(self):
+        return {
+            "request_id": self.request_id,
+            "user_id": self.user_id,
+            "type": self.type,
+            "data": self.data,
+            "status": self.status,
+            "created_at": self.created_at,
+            "handled_by": self.handled_by,
+            "handled_at": self.handled_at
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict):
+        req = cls(
+            data["request_id"],
+            data["user_id"],
+            data["type"],
+            data["data"]
         )
-        return ST_ICH_DEL_CONFIRM
-
-    await update.message.reply_text("⚠️ اختَر خيار من قائمة ايشانسي 👇", reply_markup=kb_ichancy())
-    return ST_ICH_MENU
-
-async def ich_create_get_desired(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["ich_menu"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    desired = safe_str(text, 64)
-    if len(desired) < 3:
-        await update.message.reply_text("⚠️ اسم غير مناسب. جرّب اسم أطول شوي 👇", reply_markup=kb_back_only())
-        return ST_ICH_CREATE_DESIRED
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    best = await inv_find_best_match(storage, desired)
-    if not best:
-        await update.message.reply_text(TXT["ich_no_suggest"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    context.user_data["inv_suggest_id"] = int(best["id"])
-    await update.message.reply_text(
-        TXT["ich_suggest"].format(u=best["username"]),
-        reply_markup=kb_confirm_inline(CB_ICH_CREATE_OK, CB_ICH_CREATE_NO),
-    )
-    return ST_ICH_CREATE_CONFIRM
-
-async def cb_ich_create_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_ICH_CREATE_NO:
-        context.user_data.clear()
-        await q.message.reply_text("✅ تمام، إذا بدك جرّب اسم مختلف.", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    user_id = q.from_user.id
-    inv_id = context.user_data.get("inv_suggest_id")
-    if not inv_id:
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ ما عاد في اقتراح محفوظ. أعد المحاولة.", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    assigned = await inv_assign(storage, int(inv_id), user_id)
-    if not assigned:
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ للأسف الحساب لم يعد متاح.\nجرّب مرة ثانية باسم آخر 🙏", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    u = assigned["username"]
-    p = assigned["password"]
-    await set_user_ichancy(storage, user_id, u, p)
-
-    order = await create_order(storage, OT_ICH_CREATE, user_id,
-                               {"inv_id": int(inv_id), "ichancy_username": u},
-                               status=ST_APPROVED)
-
-    await q.message.reply_text(TXT["ich_delivered"].format(u=u, p=p), reply_markup=kb_ichancy())
-    await q.message.reply_text(TXT["ich_copy_block"].format(u=u, p=p))
-    await q.message.reply_text(TXT["ich_copy_line"].format(u=u, p=p))
-
-    await notify_admins(context, "✅ تم تسليم حساب ايشانسي من المخزون:\n" + fmt_order(order))
-    context.user_data.clear()
-    return ST_ICH_MENU
-
-async def cb_ich_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_ICH_DEL_NO:
-        await q.message.reply_text("✅ تمام، ما حذفنا شي.", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    ok = await delete_user_ichancy(storage, q.from_user.id)
-    await q.message.reply_text(TXT["ich_deleted"] if ok else "ℹ️ ما كان في حساب محفوظ.", reply_markup=kb_ichancy())
-    return ST_ICH_MENU
-
-async def ich_topup_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["ich_menu"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    ia = parse_int(text)
-    if ia is None or ia <= 0:
-        await update.message.reply_text("⚠️ أرسل رقم صحيح 👇", reply_markup=kb_back_only())
-        return ST_ICH_TOPUP_AMOUNT
-    if ia % 100 != 0:
-        await update.message.reply_text(TXT["must_multiple_100"], reply_markup=kb_back_only())
-        return ST_ICH_TOPUP_AMOUNT
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    u = await get_user(storage, update.effective_user.id)
-    ich_u = ((u or {}).get("ichancy") or {}).get("username")
-    if not ich_u:
-        await update.message.reply_text(TXT["ich_no_account"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    cost = ia // 100
-    w = await get_wallet(storage, update.effective_user.id)
-    if w["balance"] < cost:
-        await update.message.reply_text(TXT["insufficient"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    context.user_data["ich_u"] = ich_u
-    context.user_data["ich_ia"] = int(ia)
-    context.user_data["ich_cost"] = int(cost)
-
-    msg = TXT["ich_topup_confirm"].format(u=ich_u, ia=ia, cost=cost)
-    await update.message.reply_text(msg, reply_markup=kb_confirm_inline(CB_ICH_TOPUP_OK, CB_ICH_TOPUP_NO))
-    return ST_ICH_TOPUP_CONFIRM
-
-async def cb_ich_topup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_ICH_TOPUP_NO:
-        context.user_data.clear()
-        await q.message.reply_text(TXT["cancelled"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    user_id = q.from_user.id
-    ich_u = context.user_data.get("ich_u")
-    ia = context.user_data.get("ich_ia")
-    cost = context.user_data.get("ich_cost")
-    if not (ich_u and ia and cost is not None):
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ بيانات ناقصة. أعد العملية.", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    order = await create_order(storage, OT_ICH_TOPUP, user_id,
-                               {"ichancy_username": ich_u, "ichancy_amount": int(ia), "bot_cost": int(cost)},
-                               status=ST_PENDING)
-
-    context.user_data.clear()
-    await q.message.reply_text(TXT["sent_admin"].format(id=order["id"]), reply_markup=kb_ichancy())
-    admin_text = fmt_order(order) + "\n\n📌 نسخ اسم الحساب:\n" + codeblock(str(ich_u))
-    await notify_admins(context, admin_text, reply_markup=kb_order_actions(order["id"]))
-    return ST_ICH_MENU
-
-async def ich_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.effective_user:
-        return ConversationHandler.END
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["ich_menu"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    ia = parse_int(text)
-    if ia is None or ia <= 0:
-        await update.message.reply_text("⚠️ أرسل رقم صحيح 👇", reply_markup=kb_back_only())
-        return ST_ICH_WD_AMOUNT
-    if ia % 100 != 0:
-        await update.message.reply_text(TXT["must_multiple_100"], reply_markup=kb_back_only())
-        return ST_ICH_WD_AMOUNT
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    u = await get_user(storage, update.effective_user.id)
-    ich_u = ((u or {}).get("ichancy") or {}).get("username")
-    if not ich_u:
-        await update.message.reply_text(TXT["ich_no_account"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    gain = ia // 100
-    context.user_data["ich_u"] = ich_u
-    context.user_data["ich_ia"] = int(ia)
-    context.user_data["ich_gain"] = int(gain)
-
-    msg = TXT["ich_withdraw_confirm"].format(u=ich_u, ia=ia, gain=gain)
-    await update.message.reply_text(msg, reply_markup=kb_confirm_inline(CB_ICH_WD_OK, CB_ICH_WD_NO))
-    return ST_ICH_WD_CONFIRM
-
-async def cb_ich_withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    if not q:
-        return ConversationHandler.END
-    await q.answer()
-
-    if not await user_allowed(update, context):
-        return ConversationHandler.END
-
-    if q.data == CB_ICH_WD_NO:
-        context.user_data.clear()
-        await q.message.reply_text(TXT["cancelled"], reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    user_id = q.from_user.id
-    ich_u = context.user_data.get("ich_u")
-    ia = context.user_data.get("ich_ia")
-    gain = context.user_data.get("ich_gain")
-    if not (ich_u and ia and gain is not None):
-        context.user_data.clear()
-        await q.message.reply_text("⚠️ بيانات ناقصة. أعد العملية.", reply_markup=kb_ichancy())
-        return ST_ICH_MENU
-
-    order = await create_order(storage, OT_ICH_WITHDRAW, user_id,
-                               {"ichancy_username": ich_u, "ichancy_amount": int(ia), "bot_gain": int(gain)},
-                               status=ST_PENDING)
-
-    context.user_data.clear()
-    await q.message.reply_text(TXT["sent_admin"].format(id=order["id"]), reply_markup=kb_ichancy())
-    admin_text = fmt_order(order) + "\n\n📌 نسخ اسم الحساب:\n" + codeblock(str(ich_u))
-    await notify_admins(context, admin_text, reply_markup=kb_order_actions(order["id"]))
-    return ST_ICH_MENU
-
-# =========================
-# Admin commands + features
-# =========================
-
-def extract_user_id_from_message(update: Update) -> Optional[int]:
-    if update.message and update.message.forward_from:
-        return int(update.message.forward_from.id)
-    if update.message:
-        n = parse_int(update.message.text or "")
-        if n and n > 0:
-            return int(n)
-    return None
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await is_admin_any(update, context):
-        await update.message.reply_text(TXT["admin_only"])
-        return ConversationHandler.END
-    await update.message.reply_text(TXT["admin_menu"], reply_markup=kb_admin())
-    return AD_MENU
-
-async def admin_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await is_admin_any(update, context):
-        await update.message.reply_text(TXT["admin_only"])
-        return ConversationHandler.END
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["back_main"], reply_markup=kb_user_main())
-        return ConversationHandler.END
-
-    if text == "📌 الطلبات المعلقة":
-        pending = await list_pending(storage, limit=25)
-        if not pending:
-            await update.message.reply_text(TXT["admin_no_pending"], reply_markup=kb_admin())
-            return AD_MENU
-        await update.message.reply_text(TXT["admin_pending_title"])
-        for o in pending:
-            await update.message.reply_text(fmt_order(o), reply_markup=kb_order_actions(o["id"]))
-        return AD_MENU
-
-    if text == "🔍 بحث مستخدم":
-        await update.message.reply_text(TXT["admin_ask_user"])
-        return AD_FIND_USER
-
-    if text == "💳 تعديل رصيد (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await update.message.reply_text(TXT["admin_ask_user"])
-        return AD_ADJUST_USER
-
-    if text == "📦 مخزون ايشانسي (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await update.message.reply_text(TXT["inv_menu"], reply_markup=kb_inventory())
-        return AD_INV_MENU
-
-    if text == "👤 أدمن مساعد (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await update.message.reply_text(TXT["admin_manage_assist"], reply_markup=kb_admin_assist())
-        return AD_AS_MENU
-
-    if text == "📣 رسالة جماعية (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await update.message.reply_text(TXT["admin_broadcast_prompt"])
-        return AD_BROADCAST
-
-    if text == "💾 Backup (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await admin_backup(update, context)
-        return AD_MENU
-
-    if text == "♻️ Restore (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        await set_maintenance(context, True)  # auto maintenance
-        await update.message.reply_text(TXT["restore_start"])
-        return AD_RESTORE_WAIT
-
-    if text == "🔧 صيانة ON/OFF (Super)":
-        if not is_super_admin(update, context):
-            await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-            return AD_MENU
-        on = await is_maintenance_on(context)
-        await set_maintenance(context, not on)
-        await update.message.reply_text(TXT["maintenance_off"] if on else TXT["maintenance_on"])
-        return AD_MENU
-
-    await update.message.reply_text("⚠️ اختر خيار من لوحة الأدمن 👇", reply_markup=kb_admin())
-    return AD_MENU
-
-async def admin_find_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not await is_admin_any(update, context):
-        await update.message.reply_text(TXT["admin_only"])
-        return ConversationHandler.END
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    uid = extract_user_id_from_message(update)
-    if not uid:
-        await update.message.reply_text("⚠️ أرسل ID رقمي أو حوّل رسالة منه 👇")
-        return AD_FIND_USER
-
-    u = await get_user(storage, uid)
-    if not u:
-        await update.message.reply_text(TXT["admin_user_not_found"])
-        return AD_MENU
-
-    w = await get_wallet(storage, uid)
-    ich_u = ((u.get("ichancy") or {}) if isinstance(u, dict) else {}).get("username")
-
-    await update.message.reply_text(
-        f"👤 المستخدم: {uid}\n"
-        f"@{u.get('username')}\n"
-        f"📛 الاسم: {u.get('first_name')} {u.get('last_name')}\n"
-        f"💼 ايشانسي: {ich_u if ich_u else 'لا يوجد'}\n"
-        f"💰 balance={w['balance']} | hold={w['hold']}"
-    )
-    return AD_MENU
-
-async def admin_adjust_user_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    uid = extract_user_id_from_message(update)
-    if not uid:
-        await update.message.reply_text("⚠️ أرسل ID رقمي أو حوّل رسالة منه 👇")
-        return AD_ADJUST_USER
-
-    context.user_data["admin_target_user"] = int(uid)
-    await update.message.reply_text(TXT["admin_adjust_amount"])
-    return AD_ADJUST_AMOUNT
-
-async def admin_adjust_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    amt = parse_int(update.message.text or "")
-    if amt is None:
-        await update.message.reply_text("⚠️ قيمة غير صحيحة.\nمثال: 1000 أو -500")
-        return AD_ADJUST_AMOUNT
-
-    uid = context.user_data.get("admin_target_user")
-    if not uid:
-        await update.message.reply_text("⚠️ لم يتم اختيار مستخدم.")
-        return AD_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    w = await add_balance(storage, int(uid), int(amt))
-    await update.message.reply_text(f"{TXT['admin_adjust_done']}\nwallet: balance={w['balance']} hold={w['hold']}")
-    return AD_MENU
-
-# ----- order callbacks -----
-
-async def admin_order_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-
-    if not await is_admin_any(update, context):
-        await q.message.reply_text(TXT["admin_only"])
-        return
-
-    data = q.data or ""
-    if ":" not in data:
-        return
-    action, sid = data.split(":", 1)
-    oid = parse_int(sid)
-    if not oid:
-        return
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    order = await get_order(storage, int(oid))
-    if not order:
-        await q.message.reply_text("❌ الطلب غير موجود.")
-        return
-
-    if action == CB_ORDER_EDIT:
-        context.user_data["edit_order_id"] = int(oid)
-        await q.message.reply_text(TXT["admin_edit_hint"])
-        return
-
-    if action == CB_ORDER_APPROVE:
-        await admin_approve_order(context, order, q)
-        return
-
-    if action == CB_ORDER_REJECT:
-        await admin_reject_order(context, order, q)
-        return
-
-async def admin_edit_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not await is_admin_any(update, context):
-        return
-
-    edit_id = context.user_data.get("edit_order_id")
-    if not edit_id:
-        return
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    order = await get_order(storage, int(edit_id))
-    if not order:
-        context.user_data.pop("edit_order_id", None)
-        await update.message.reply_text("❌ الطلب غير موجود.")
-        return
-
-    text = safe_str(update.message.text, 256)
-    otype = order.get("type")
-    data = dict(order.get("data", {}) or {})
-
+        req.status = data.get("status", "pending")
+        req.created_at = data.get("created_at", datetime.now().isoformat())
+        req.handled_by = data.get("handled_by")
+        req.handled_at = data.get("handled_at")
+        return req
+
+# ==================== STORAGE FUNCTIONS ====================
+async def atomic_write(file_path: Path, data: dict):
+    """Atomic write with asyncio lock"""
+    lock = file_locks.get(file_path)
+    if not lock:
+        lock = asyncio.Lock()
+        file_locks[file_path] = lock
+    
+    async with lock:
+        # Write to temp file first
+        temp_file = file_path.with_suffix('.tmp')
+        async with aiofiles.open(temp_file, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        
+        # Replace original file
+        await aiofiles.os.replace(temp_file, file_path)
+
+async def load_data(file_path: Path, default: Any = None):
+    """Load JSON data with lock"""
+    if default is None:
+        default = {}
+    
+    if not await aiofiles.os.path.exists(file_path):
+        return default.copy() if isinstance(default, dict) else default
+    
+    lock = file_locks.get(file_path)
+    if lock:
+        async with lock:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content) if content else default.copy()
+    else:
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+            content = await f.read()
+            return json.loads(content) if content else default.copy()
+
+async def save_data(file_path: Path, data: Any):
+    """Save data atomically"""
+    await atomic_write(file_path, data)
+
+# ==================== DATA MANAGERS ====================
+class DataManager:
+    @staticmethod
+    async def get_user(user_id: int) -> Optional[UserData]:
+        users = await load_data(USERS_FILE, {})
+        user_data = users.get(str(user_id))
+        return UserData.from_dict(user_data) if user_data else None
+    
+    @staticmethod
+    async def save_user(user: UserData):
+        users = await load_data(USERS_FILE, {})
+        users[str(user.user_id)] = user.to_dict()
+        await save_data(USERS_FILE, users)
+    
+    @staticmethod
+    async def get_all_users() -> Dict[int, UserData]:
+        users = await load_data(USERS_FILE, {})
+        return {int(uid): UserData.from_dict(data) for uid, data in users.items()}
+    
+    @staticmethod
+    async def get_accounts() -> Dict[str, EshansyAccount]:
+        accounts = await load_data(ACCOUNTS_FILE, {})
+        return {username: EshansyAccount.from_dict(data) for username, data in accounts.items()}
+    
+    @staticmethod
+    async def save_accounts(accounts: Dict[str, EshansyAccount]):
+        data = {username: acc.to_dict() for username, acc in accounts.items()}
+        await save_data(ACCOUNTS_FILE, data)
+    
+    @staticmethod
+    async def get_pending_requests() -> Dict[str, PendingRequest]:
+        pending = await load_data(PENDING_FILE, {})
+        return {req_id: PendingRequest.from_dict(data) for req_id, data in pending.items()}
+    
+    @staticmethod
+    async def save_pending_requests(requests: Dict[str, PendingRequest]):
+        data = {req_id: req.to_dict() for req_id, req in requests.items()}
+        await save_data(PENDING_FILE, data)
+    
+    @staticmethod
+    async def get_admins() -> List[int]:
+        admins = await load_data(ADMINS_FILE, [])
+        return admins
+    
+    @staticmethod
+    async def save_admins(admins: List[int]):
+        await save_data(ADMINS_FILE, admins)
+    
+    @staticmethod
+    async def is_maintenance() -> bool:
+        maintenance = await load_data(MAINTENANCE_FILE, {"active": False})
+        return maintenance.get("active", False)
+    
+    @staticmethod
+    async def set_maintenance(active: bool):
+        await save_data(MAINTENANCE_FILE, {"active": active})
+
+# ==================== KEYBOARDS ====================
+def get_main_keyboard():
+    return ReplyKeyboardMarkup([
+        ["💼 حساب ايشانسي", "💰 محفظتي"],
+        ["➕ شحن رصيد البوت", "➖ سحب رصيد من البوت"],
+        ["🧾 إلغاء آخر طلب سحب", "🆘 دعم"]
+    ], resize_keyboard=True, one_time_keyboard=False)
+
+def get_eshansy_keyboard():
+    return ReplyKeyboardMarkup([
+        ["📝 إنشاء / استلام حساب", "💰 شحن حساب ايشانسي"],
+        ["💸 سحب من حساب ايشانسي", "🗑️ حذف حساب ايشانسي"],
+        ["🔙 رجوع"]
+    ], resize_keyboard=True)
+
+def get_topup_methods_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💳 شام كاش", callback_data="topup_sham"),
+            InlineKeyboardButton("📲 سيرياتيل كاش", callback_data="topup_syriatel")
+        ]
+    ])
+
+def get_withdraw_methods_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💳 شام كاش", callback_data="withdraw_sham"),
+            InlineKeyboardButton("📲 سيرياتيل كاش", callback_data="withdraw_syriatel")
+        ]
+    ])
+
+def get_syriatel_codes_keyboard():
+    buttons = []
+    for code in SYRIATEL_CODES:
+        buttons.append([InlineKeyboardButton(f"📞 {code}", callback_data=f"code_{code}")])
+    buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    return InlineKeyboardMarkup(buttons)
+
+def get_subscription_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ اشترك بالقناة", url=f"https://t.me/{REQUIRED_CHANNEL[1:]}")
+        ],
+        [
+            InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")
+        ]
+    ])
+
+def get_admin_keyboard(is_super: bool = False):
+    buttons = [
+        ["📊 الإحصائيات", "👥 المستخدمين"],
+        ["📨 الطلبات المعلقة", "⚙️ إعدادات"],
+        ["📢 رسالة جماعية"]
+    ]
+    if is_super:
+        buttons.append(["💾 Backup/Restore", "🔧 الصيانة"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_pending_actions_keyboard(request_id: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ قبول", callback_data=f"approve_{request_id}"),
+            InlineKeyboardButton("❌ رفض", callback_data=f"reject_{request_id}")
+        ],
+        [
+            InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_{request_id}")
+        ]
+    ])
+
+# ==================== CONVERSATION STATES ====================
+class States:
+    MAIN_MENU = 0
+    ESHANSY_MENU = 1
+    ESHANSY_CREATE = 2
+    ESHANSY_TOPUP = 3
+    ESHANSY_WITHDRAW = 4
+    TOPUP_METHOD = 10
+    TOPUP_SYRIA_CODE = 11
+    TOPUP_SYRIA_REF = 12
+    TOPUP_SYRIA_AMOUNT = 13
+    TOPUP_CONFIRM = 14
+    WITHDRAW_METHOD = 20
+    WITHDRAW_SYRIA_NUMBER = 21
+    WITHDRAW_SYRIA_AMOUNT = 22
+    WITHDRAW_CONFIRM = 23
+    ADMIN_BROADCAST = 30
+    ADMIN_BROADCAST_CONFIRM = 31
+    ADMIN_ADD_ACCOUNT = 40
+    ADMIN_DELETE_ACCOUNT = 41
+    ADMIN_MODIFY_BALANCE = 42
+    ADMIN_SEARCH_USER = 43
+
+# ==================== UTILITY FUNCTIONS ====================
+def generate_request_id():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+async def check_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     try:
-        if otype == OT_BOT_TOPUP:
-            if "," not in text:
-                await update.message.reply_text("⚠️ الصيغة: code,op,amount")
-                return
-            a, b, c = [p.strip() for p in text.split(",", 2)]
-            amt = parse_int(c)
-            if not a or not b or amt is None or amt <= 0:
-                await update.message.reply_text("⚠️ قيم غير صحيحة.")
-                return
-            data["code"] = a
-            data["operation_no"] = b
-            data["amount"] = int(amt)
+        user = await DataManager.get_user(user_id)
+        if user and user.subscribed:
+            return True
+            
+        chat_member = await context.bot.get_chat_member(
+            chat_id=REQUIRED_CHANNEL,
+            user_id=user_id
+        )
+        is_subscribed = chat_member.status in ["member", "administrator", "creator"]
+        
+        if is_subscribed:
+            user = user or UserData(user_id)
+            user.subscribed = True
+            await DataManager.save_user(user)
+        
+        return is_subscribed
+    except Exception as e:
+        logger.error(f"Error checking subscription: {e}")
+        return False
 
-        elif otype == OT_BOT_WITHDRAW:
-            if "," not in text:
-                await update.message.reply_text("⚠️ الصيغة: receiver,amount")
+async def require_subscription(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        if await DataManager.is_maintenance():
+            if not await is_admin(user_id):
+                await update.message.reply_text(
+                    "⚙️ البوت في وضع الصيانة. الرجاء المحاولة لاحقًا."
+                )
                 return
-            a, b = [p.strip() for p in text.split(",", 1)]
-            amt = parse_int(b)
-            if not a or amt is None or amt <= 0:
-                await update.message.reply_text("⚠️ قيم غير صحيحة.")
-                return
-            data["receiver_no"] = a
-            data["amount"] = int(amt)
-
-        elif otype in (OT_ICH_TOPUP, OT_ICH_WITHDRAW):
-            ia = parse_int(text)
-            if ia is None or ia <= 0 or ia % 100 != 0:
-                await update.message.reply_text(TXT["must_multiple_100"])
-                return
-            data["ichancy_amount"] = int(ia)
-            if otype == OT_ICH_TOPUP:
-                data["bot_cost"] = int(ia // 100)
-            else:
-                data["bot_gain"] = int(ia // 100)
-        else:
-            await update.message.reply_text("⚠️ هذا النوع لا يدعم التعديل هنا.")
-            context.user_data.pop("edit_order_id", None)
+                
+        if not await check_subscription(context, user_id):
+            await update.message.reply_text(
+                f"👋 مرحباً {update.effective_user.first_name}!\n\n"
+                f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
+                "بعد الاشتراك اضغط على زر التحقق",
+                reply_markup=get_subscription_keyboard()
+            )
             return
+        
+        return await func(update, context)
+    return wrapper
 
-        await update_order(storage, int(edit_id), {"data": data})
-        context.user_data.pop("edit_order_id", None)
-        await update.message.reply_text("✅ تم تعديل الطلب بنجاح.")
-    except Exception:
-        context.user_data.pop("edit_order_id", None)
-        await update.message.reply_text("⚠️ تعذر التعديل. جرّب مرة ثانية.")
+async def is_admin(user_id: int) -> bool:
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    
+    user = await DataManager.get_user(user_id)
+    if user and (user.is_admin or user.is_super_admin):
+        return True
+    
+    admins = await DataManager.get_admins()
+    return user_id in admins
 
-async def admin_approve_order(context: ContextTypes.DEFAULT_TYPE, order: dict, q) -> None:
-    storage: JSONStorage = context.application.bot_data["storage"]
-    oid = int(order["id"])
-    if order.get("status") != ST_PENDING:
-        await q.message.reply_text("ℹ️ هذا الطلب ليس Pending.")
+async def is_super_admin(user_id: int) -> bool:
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    
+    user = await DataManager.get_user(user_id)
+    return user and user.is_super_admin
+
+async def send_to_admins(context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = ParseMode.HTML):
+    """Send message to all admins"""
+    users = await DataManager.get_all_users()
+    for user in users.values():
+        if user.is_admin or user.is_super_admin:
+            try:
+                await context.bot.send_message(
+                    chat_id=user.user_id,
+                    text=message,
+                    parse_mode=parse_mode
+                )
+            except Exception as e:
+                logger.error(f"Failed to send to admin {user.user_id}: {e}")
+
+# ==================== HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Initialize user if not exists
+    user = await DataManager.get_user(user_id)
+    if not user:
+        user = UserData(user_id)
+        if user_id == SUPER_ADMIN_ID:
+            user.is_super_admin = True
+            user.is_admin = True
+        await DataManager.save_user(user)
+    
+    # Check subscription
+    if await check_subscription(context, user_id):
+        await update.message.reply_text(
+            f"👋 أهلاً وسهلاً {update.effective_user.first_name}!\n"
+            "🚀 تم التحقق من اشتراكك بنجاح.\n\n"
+            "⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    else:
+        await update.message.reply_text(
+            f"👋 مرحباً {update.effective_user.first_name}!\n\n"
+            f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
+            "بعد الاشتراك اضغط على زر التحقق",
+            reply_markup=get_subscription_keyboard()
+        )
+        return ConversationHandler.END
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if await check_subscription(context, user_id):
+        await query.edit_message_text(
+            f"✅ تم التحقق من اشتراكك بنجاح!\n\n"
+            f"👋 أهلاً وسهلاً {query.from_user.first_name}!\n"
+            "⚡ اختر من القائمة:"
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    else:
+        await query.edit_message_text(
+            "❌ لم يتم التحقق من اشتراكك بعد.\n"
+            f"📍 يجب الاشتراك في: {REQUIRED_CHANNEL}\n\n"
+            "بعد الاشتراك اضغط على زر التحقق مرة أخرى",
+            reply_markup=get_subscription_keyboard()
+        )
+        return ConversationHandler.END
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await DataManager.is_maintenance() and not await is_admin(update.effective_user.id):
+        await update.message.reply_text("⚙️ البوت في وضع الصيانة. الرجاء المحاولة لاحقًا.")
         return
+    
+    text = update.message.text
+    
+    if text.startswith("💼 حساب ايشانسي"):
+        return await eshansy_menu(update, context)
+    elif text.startswith("💰 محفظتي"):
+        return await my_wallet(update, context)
+    elif text.startswith("➕ شحن رصيد البوت"):
+        return await topup_menu(update, context)
+    elif text.startswith("➖ سحب رصيد من البوت"):
+        return await withdraw_menu(update, context)
+    elif text.startswith("🧾 إلغاء آخر طلب سحب"):
+        return await cancel_last_withdraw(update, context)
+    elif text.startswith("🆘 دعم"):
+        return await support(update, context)
+    elif text == "/admin":
+        return await admin_panel(update, context)
+    else:
+        await update.message.reply_text(
+            "⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
 
-    otype = order.get("type")
-    user_id = int(order.get("user_id"))
-    data = order.get("data", {}) or {}
+# ==================== WALLET FUNCTIONS ====================
+@require_subscription
+async def my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await DataManager.get_user(user_id)
+    
+    if not user:
+        user = UserData(user_id)
+        await DataManager.save_user(user)
+    
+    message = (
+        f"💰 <b>محفظتك</b>\n\n"
+        f"💵 الرصيد المتاح: <code>{user.balance:,.0f}</code> ليرة\n"
+        f"🔒 المبلغ المحجوز: <code>{user.hold:,.0f}</code> ليرة\n"
+        f"⚖️ الرصيد الإجمالي: <code>{user.balance + user.hold:,.0f}</code> ليرة\n\n"
+    )
+    
+    if user.eshansy_account:
+        message += (
+            f"💼 <b>حساب ايشانسي</b>\n"
+            f"👤 الحساب: <code>{user.eshansy_account}</code>\n"
+            f"💰 الرصيد: <code>{user.eshansy_balance}</code> نقطة\n\n"
+        )
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
 
+# ==================== ESHANSY FUNCTIONS ====================
+@require_subscription
+async def eshansy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💼 <b>قائمة حساب ايشانسي</b>\n\n"
+        "اختر الخدمة المطلوبة:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_eshansy_keyboard()
+    )
+    return States.ESHANSY_MENU
+
+@require_subscription
+async def eshansy_create_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await DataManager.get_user(user_id)
+    
+    if user.eshansy_account:
+        accounts = await DataManager.get_accounts()
+        account = accounts.get(user.eshansy_account)
+        
+        message = (
+            f"📋 <b>حسابك الحالي</b>\n\n"
+            f"👤 اسم المستخدم: <code>{account.username}</code>\n"
+            f"🔑 كلمة المرور: <code>{account.password}</code>\n\n"
+            f"💰 رصيدك في ايشانسي: <code>{user.eshansy_balance}</code> نقطة\n\n"
+            "يمكنك نسخ المعلومات بالأعلى."
+        )
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    await update.message.reply_text(
+        "📝 <b>إنشاء حساب ايشانسي جديد</b>\n\n"
+        "أدخل اسم مستخدم تقريبي (باللغة الإنجليزية):\n"
+        "مثال: user123",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return States.ESHANSY_CREATE
+
+async def eshansy_create_account_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    suggested_username = update.message.text.strip().lower()
+    
+    accounts = await DataManager.get_accounts()
+    available_accounts = {username: acc for username, acc in accounts.items() if not acc.assigned_to}
+    
+    if not available_accounts:
+        await update.message.reply_text(
+            "❌ لا توجد حسابات متاحة حالياً.\n"
+            "الرجاء التواصل مع الدعم أو المحاولة لاحقاً.",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    # Find best match
+    best_match = None
+    best_ratio = 0
+    
+    for username in available_accounts.keys():
+        ratio = difflib.SequenceMatcher(None, suggested_username, username).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match = username
+    
+    if best_match:
+        context.user_data["suggested_account"] = best_match
+        await update.message.reply_text(
+            f"✨ <b>أقترح لك هذا الحساب:</b>\n\n"
+            f"👤 <code>{best_match}</code>\n\n"
+            "هل تريد تأكيد الاستلام؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy"),
+                    InlineKeyboardButton("❌ رفض", callback_data="reject_eshansy")
+                ]
+            ])
+        )
+        return States.ESHANSY_CREATE
+    else:
+        await update.message.reply_text(
+            "❌ لم أتمكن من العثور على حساب مناسب.\n"
+            "الرجاء المحاولة باسم مختلف.",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+
+async def eshansy_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_eshansy":
+        username = context.user_data.get("suggested_account")
+        if not username:
+            await query.edit_message_text("❌ حدث خطأ. الرجاء المحاولة مرة أخرى.")
+            return States.ESHANSY_MENU
+        
+        accounts = await DataManager.get_accounts()
+        account = accounts.get(username)
+        
+        if not account or account.assigned_to:
+            await query.edit_message_text("❌ الحساب لم يعد متاحاً.")
+            return States.ESHANSY_MENU
+        
+        # Assign account
+        user_id = query.from_user.id
+        account.assigned_to = user_id
+        account.assigned_at = datetime.now().isoformat()
+        
+        user = await DataManager.get_user(user_id)
+        user.eshansy_account = username
+        user.eshansy_balance = 0
+        
+        await DataManager.save_accounts(accounts)
+        await DataManager.save_user(user)
+        
+        message = (
+            f"✅ <b>تم استلام الحساب بنجاح!</b>\n\n"
+            f"👤 اسم المستخدم: <code>{account.username}</code>\n"
+            f"🔑 كلمة المرور: <code>{account.password}</code>\n\n"
+            "🔒 <i>احفظ هذه المعلومات في مكان آمن</i>"
+        )
+        await query.edit_message_text(
+            message,
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Send to main menu
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="💼 اختر من قائمة ايشانسي:",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    else:
+        await query.edit_message_text("❌ تم إلغاء العملية.")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="💼 اختر من قائمة ايشانسي:",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+
+@require_subscription
+async def eshansy_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await DataManager.get_user(user_id)
+    
+    if not user.eshansy_account:
+        await update.message.reply_text(
+            "❌ ليس لديك حساب ايشانسي.\n"
+            "الرجاء إنشاء حساب أولاً.",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    await update.message.reply_text(
+        "💰 <b>شحن حساب ايشانسي</b>\n\n"
+        "أدخل المبلغ بالليرة السورية:\n"
+        "ملاحظة: كل 1 ليرة = 100 نقطة ايشانسي\n\n"
+        "مثال: لإضافة 1000 نقطة، أدخل 10",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return States.ESHANSY_TOPUP
+
+async def eshansy_topup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if otype == OT_BOT_TOPUP:
-            amt = int(data.get("amount", 0))
-            await add_balance(storage, user_id, amt)
-            await update_order(storage, oid, {"status": ST_APPROVED})
-            await q.message.reply_text(TXT["admin_order_updated"].format(status=ST_APPROVED))
-            try:
-                await context.bot.send_message(chat_id=user_id, text=TXT["user_approved"].format(id=oid))
-            except Exception:
-                pass
+        amount = float(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+        
+        user_id = update.effective_user.id
+        user = await DataManager.get_user(user_id)
+        
+        required_balance = amount  # 1 ليرة = 100 نقطة
+        
+        if user.balance < required_balance:
+            await update.message.reply_text(
+                f"❌ رصيدك غير كافي.\n"
+                f"💵 رصيدك: {user.balance:,.0f} ليرة\n"
+                f"💰 المطلوب: {required_balance:,.0f} ليرة",
+                reply_markup=get_eshansy_keyboard()
+            )
+            return States.ESHANSY_MENU
+        
+        context.user_data["eshansy_topup"] = {
+            "amount_sy": amount,
+            "eshansy_points": int(amount * 100)
+        }
+        
+        await update.message.reply_text(
+            f"📋 <b>تفاصيل الشحن</b>\n\n"
+            f"💵 المبلغ: <code>{amount:,.0f}</code> ليرة\n"
+            f"🎯 النقاط: <code>{int(amount * 100):,}</code> نقطة\n\n"
+            f"💳 سيتم خصم: <code>{amount:,.0f}</code> ليرة من رصيدك\n\n"
+            "هل تريد المتابعة؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy_topup"),
+                    InlineKeyboardButton("❌ إلغاء", callback_data="cancel_eshansy_topup")
+                ]
+            ])
+        )
+        return States.ESHANSY_TOPUP
+    except ValueError:
+        await update.message.reply_text(
+            "❌ المبلغ غير صحيح. الرجاء إدخال رقم صحيح.\n"
+            "مثال: 10",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
 
-        elif otype == OT_BOT_WITHDRAW:
-            amt = int(data.get("amount", 0))
-            await finalize_withdraw(storage, user_id, amt)
-            await update_order(storage, oid, {"status": ST_APPROVED})
-            await q.message.reply_text(TXT["admin_order_updated"].format(status=ST_APPROVED))
-            try:
-                await context.bot.send_message(chat_id=user_id, text=TXT["user_approved_24h"].format(id=oid))
-            except Exception:
-                pass
+async def eshansy_topup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_eshansy_topup":
+        data = context.user_data.get("eshansy_topup")
+        if not data:
+            await query.edit_message_text("❌ انتهت صلاحية البيانات.")
+            return States.ESHANSY_MENU
+        
+        user_id = query.from_user.id
+        user = await DataManager.get_user(user_id)
+        
+        if user.balance < data["amount_sy"]:
+            await query.edit_message_text("❌ رصيدك غير كافي.")
+            return States.ESHANSY_MENU
+        
+        # Deduct from user balance
+        user.balance -= data["amount_sy"]
+        user.eshansy_balance += data["eshansy_points"]
+        
+        # Create pending request for admin notification
+        request_id = generate_request_id()
+        pending_request = PendingRequest(
+            request_id=request_id,
+            user_id=user_id,
+            req_type="eshansy_topup",
+            data={
+                "amount_sy": data["amount_sy"],
+                "eshansy_points": data["eshansy_points"],
+                "username": user.eshansy_account
+            }
+        )
+        
+        pending = await DataManager.get_pending_requests()
+        pending[request_id] = pending_request
+        await DataManager.save_pending_requests(pending)
+        
+        await DataManager.save_user(user)
+        
+        # Notify admins
+        admin_message = (
+            f"🔄 <b>طلب شحن ايشانسي جديد</b>\n\n"
+            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+            f"👤 المستخدم: {user_id}\n"
+            f"👤 حساب ايشانسي: {user.eshansy_account}\n"
+            f"💰 المبلغ: {data['amount_sy']:,.0f} ليرة\n"
+            f"🎯 النقاط: {data['eshansy_points']:,} نقطة"
+        )
+        await send_to_admins(context, admin_message)
+        
+        await query.edit_message_text(
+            f"✅ <b>تم شحن حسابك بنجاح!</b>\n\n"
+            f"🎯 تم إضافة: <code>{data['eshansy_points']:,}</code> نقطة\n"
+            f"💵 تم خصم: <code>{data['amount_sy']:,.0f}</code> ليرة\n\n"
+            f"💰 رصيدك الحالي في ايشانسي: <code>{user.eshansy_balance:,}</code> نقطة",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await query.edit_message_text("❌ تم إلغاء العملية.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="💼 اختر من قائمة ايشانسي:",
+        reply_markup=get_eshansy_keyboard()
+    )
+    return States.ESHANSY_MENU
 
-        elif otype == OT_ICH_TOPUP:
-            cost = int(data.get("bot_cost", 0))
-            ok, _ = await deduct_balance(storage, user_id, cost)
-            if not ok:
-                await update_order(storage, oid, {"status": ST_REJECTED})
-                await q.message.reply_text("⚠️ تم رفض الطلب تلقائياً لأن رصيد المستخدم لا يكفي وقت الموافقة.")
-                try:
-                    await context.bot.send_message(chat_id=user_id, text=TXT["user_rejected"].format(id=oid))
-                except Exception:
-                    pass
-                return
-            await update_order(storage, oid, {"status": ST_APPROVED})
-            await q.message.reply_text(TXT["admin_order_updated"].format(status=ST_APPROVED))
-            try:
-                await context.bot.send_message(chat_id=user_id, text=TXT["user_approved"].format(id=oid))
-            except Exception:
-                pass
+@require_subscription
+async def eshansy_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await DataManager.get_user(user_id)
+    
+    if not user.eshansy_account:
+        await update.message.reply_text(
+            "❌ ليس لديك حساب ايشانسي.",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    await update.message.reply_text(
+        "💸 <b>سحب من حساب ايشانسي</b>\n\n"
+        "أدخل عدد النقاط المطلوب سحبها:\n"
+        "ملاحظة: كل 100 نقطة = 1 ليرة\n\n"
+        "مثال: لسحب 1000 ليرة، أدخل 100000",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return States.ESHANSY_WITHDRAW
 
-        elif otype == OT_ICH_WITHDRAW:
-            gain = int(data.get("bot_gain", 0))
-            await add_balance(storage, user_id, gain)
-            await update_order(storage, oid, {"status": ST_APPROVED})
-            await q.message.reply_text(TXT["admin_order_updated"].format(status=ST_APPROVED))
-            try:
-                await context.bot.send_message(chat_id=user_id, text=TXT["user_approved"].format(id=oid))
-            except Exception:
-                pass
+async def eshansy_withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        points = int(update.message.text.strip())
+        if points <= 0:
+            raise ValueError
+        
+        user_id = update.effective_user.id
+        user = await DataManager.get_user(user_id)
+        
+        if user.eshansy_balance < points:
+            await update.message.reply_text(
+                f"❌ رصيدك في ايشانسي غير كافي.\n"
+                f"🎯 رصيدك: {user.eshansy_balance:,} نقطة\n"
+                f"💰 المطلوب: {points:,} نقطة",
+                reply_markup=get_eshansy_keyboard()
+            )
+            return States.ESHANSY_MENU
+        
+        amount_sy = points / 100
+        
+        context.user_data["eshansy_withdraw"] = {
+            "points": points,
+            "amount_sy": amount_sy
+        }
+        
+        await update.message.reply_text(
+            f"📋 <b>تفاصيل السحب</b>\n\n"
+            f"🎯 النقاط: <code>{points:,}</code> نقطة\n"
+            f"💵 المبلغ: <code>{amount_sy:,.0f}</code> ليرة\n\n"
+            f"💰 سيتم إضافة: <code>{amount_sy:,.0f}</code> ليرة إلى رصيدك\n\n"
+            "هل تريد المتابعة؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy_withdraw"),
+                    InlineKeyboardButton("❌ إلغاء", callback_data="cancel_eshansy_withdraw")
+                ]
+            ])
+        )
+        return States.ESHANSY_WITHDRAW
+    except ValueError:
+        await update.message.reply_text(
+            "❌ الرقم غير صحيح. الرجاء إدخال عدد صحيح.\n"
+            "مثال: 100000",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
 
+async def eshansy_withdraw_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_eshansy_withdraw":
+        data = context.user_data.get("eshansy_withdraw")
+        if not data:
+            await query.edit_message_text("❌ انتهت صلاحية البيانات.")
+            return States.ESHANSY_MENU
+        
+        user_id = query.from_user.id
+        user = await DataManager.get_user(user_id)
+        
+        if user.eshansy_balance < data["points"]:
+            await query.edit_message_text("❌ رصيدك غير كافي.")
+            return States.ESHANSY_MENU
+        
+        # Create pending request
+        request_id = generate_request_id()
+        pending_request = PendingRequest(
+            request_id=request_id,
+            user_id=user_id,
+            req_type="eshansy_withdraw",
+            data={
+                "points": data["points"],
+                "amount_sy": data["amount_sy"],
+                "username": user.eshansy_account
+            }
+        )
+        
+        pending = await DataManager.get_pending_requests()
+        pending[request_id] = pending_request
+        await DataManager.save_pending_requests(pending)
+        
+        # Notify admins
+        admin_message = (
+            f"🔄 <b>طلب سحب ايشانسي جديد</b>\n\n"
+            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+            f"👤 المستخدم: {user_id}\n"
+            f"👤 حساب ايشانسي: {user.eshansy_account}\n"
+            f"🎯 النقاط: {data['points']:,} نقطة\n"
+            f"💰 المبلغ: {data['amount_sy']:,.0f} ليرة"
+        )
+        await send_to_admins(context, admin_message)
+        
+        await query.edit_message_text(
+            f"✅ <b>تم تقديم طلب السحب!</b>\n\n"
+            f"🎯 طلب سحب: <code>{data['points']:,}</code> نقطة\n"
+            f"💵 سيصلك: <code>{data['amount_sy']:,.0f}</code> ليرة\n\n"
+            "📨 تم إرسال الطلب للإدارة. سيتم المعالجة قريباً.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await query.edit_message_text("❌ تم إلغاء العملية.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="💼 اختر من قائمة ايشانسي:",
+        reply_markup=get_eshansy_keyboard()
+    )
+    return States.ESHANSY_MENU
+
+@require_subscription
+async def eshansy_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await DataManager.get_user(user_id)
+    
+    if not user.eshansy_account:
+        await update.message.reply_text(
+            "❌ ليس لديك حساب ايشانسي لحذفه.",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    if user.eshansy_balance > 0:
+        await update.message.reply_text(
+            f"⚠️ <b>تحذير!</b>\n\n"
+            f"💰 لديك رصيد في حساب ايشانسي: <code>{user.eshansy_balance:,}</code> نقطة\n\n"
+            "يجب سحب رصيدك أولاً قبل حذف الحساب.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+    
+    await update.message.reply_text(
+        "🗑️ <b>حذف حساب ايشانسي</b>\n\n"
+        "⚠️ <i>سيتم فصل حساب ايشانسي عن حسابك في البوت فقط.\n"
+        "يمكنك استلام حساب جديد لاحقاً.</i>\n\n"
+        "هل أنت متأكد من حذف الحساب؟",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ نعم، احذف", callback_data="confirm_delete_eshansy"),
+                InlineKeyboardButton("❌ إلغاء", callback_data="cancel_delete_eshansy")
+            ]
+        ])
+    )
+    return States.ESHANSY_MENU
+
+async def eshansy_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_delete_eshansy":
+        user_id = query.from_user.id
+        user = await DataManager.get_user(user_id)
+        
+        if user.eshansy_account:
+            # Free the account
+            accounts = await DataManager.get_accounts()
+            account = accounts.get(user.eshansy_account)
+            if account:
+                account.assigned_to = None
+                account.assigned_at = None
+                await DataManager.save_accounts(accounts)
+            
+            old_account = user.eshansy_account
+            user.eshansy_account = None
+            user.eshansy_balance = 0
+            await DataManager.save_user(user)
+            
+            await query.edit_message_text(
+                f"✅ <b>تم حذف الحساب بنجاح!</b>\n\n"
+                f"👤 الحساب المحذوف: <code>{old_account}</code>\n\n"
+                "يمكنك استلام حساب جديد عندما تحتاجه.",
+                parse_mode=ParseMode.HTML
+            )
         else:
-            await q.message.reply_text("⚠️ نوع طلب غير معروف.")
-            return
+            await query.edit_message_text("❌ ليس لديك حساب لحذفه.")
+    else:
+        await query.edit_message_text("❌ تم إلغاء العملية.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="💼 اختر من قائمة ايشانسي:",
+        reply_markup=get_eshansy_keyboard()
+    )
+    return States.ESHANSY_MENU
 
-    except Exception:
-        logger.exception("Approve failed")
-        await q.message.reply_text("❌ تعذر قبول الطلب بسبب خطأ.")
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚡ القائمة الرئيسية:",
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
 
-async def admin_reject_order(context: ContextTypes.DEFAULT_TYPE, order: dict, q) -> None:
-    storage: JSONStorage = context.application.bot_data["storage"]
-    oid = int(order["id"])
-    if order.get("status") != ST_PENDING:
-        await q.message.reply_text("ℹ️ هذا الطلب ليس Pending.")
-        return
+# ==================== TOPUP FUNCTIONS ====================
+@require_subscription
+async def topup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "➕ <b>شحن رصيد البوت</b>\n\n"
+        "اختر طريقة الشحن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_topup_methods_keyboard()
+    )
+    return States.TOPUP_METHOD
 
-    otype = order.get("type")
-    user_id = int(order.get("user_id"))
-    data = order.get("data", {}) or {}
+async def topup_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "topup_sham":
+        await query.edit_message_text(
+            "💳 <b>شام كاش</b>\n\n"
+            "📍 للشحن عبر شام كاش:\n"
+            "تواصل مع الدعم مباشرة:\n"
+            f"{SUPPORT_USERNAME}",
+            parse_mode=ParseMode.HTML
+        )
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    elif query.data == "topup_syriatel":
+        await query.edit_message_text(
+            "📲 <b>سيرياتيل كاش</b>\n\n"
+            "اختر الكود الذي ستحول له:",
+            reply_markup=get_syriatel_codes_keyboard()
+        )
+        return States.TOPUP_SYRIA_CODE
+    elif query.data.startswith("code_"):
+        code = query.data[5:]
+        context.user_data["topup_code"] = code
+        
+        await query.edit_message_text(
+            f"📞 <b>الكود المختار: {code}</b>\n\n"
+            "الآن أدخل رقم عملية التحويل (رقم التحويل):\n"
+            "مثال: 123456789",
+            parse_mode=ParseMode.HTML
+        )
+        return States.TOPUP_SYRIA_REF
+    elif query.data == "back":
+        await query.edit_message_text(
+            "➕ <b>شحن رصيد البوت</b>\n\n"
+            "اختر طريقة الشحن:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_topup_methods_keyboard()
+        )
+        return States.TOPUP_METHOD
 
+async def topup_ref_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ref_number = update.message.text.strip()
+    
+    if not ref_number.isdigit():
+        await update.message.reply_text(
+            "❌ رقم التحويل غير صحيح. يجب أن يكون أرقام فقط.\n"
+            "الرجاء إعادة المحاولة:"
+        )
+        return States.TOPUP_SYRIA_REF
+    
+    context.user_data["topup_ref"] = ref_number
+    
+    await update.message.reply_text(
+        f"✅ رقم التحويل: <code>{ref_number}</code>\n\n"
+        f"أدخل المبلغ بالليرة السورية:\n"
+        f"الحد الأدنى: {MIN_TOPUP:,} ليرة",
+        parse_mode=ParseMode.HTML
+    )
+    return States.TOPUP_SYRIA_AMOUNT
+
+async def topup_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if otype == OT_BOT_WITHDRAW:
-            amt = int(data.get("amount", 0))
-            await release_hold(storage, user_id, amt)
+        amount = float(update.message.text.strip())
+        
+        if amount < MIN_TOPUP:
+            await update.message.reply_text(
+                f"❌ المبلغ أقل من الحد الأدنى.\n"
+                f"الحد الأدنى: {MIN_TOPUP:,} ليرة\n\n"
+                "الرجاء إدخال مبلغ أكبر:"
+            )
+            return States.TOPUP_SYRIA_AMOUNT
+        
+        context.user_data["topup_amount"] = amount
+        
+        await update.message.reply_text(
+            f"📋 <b>تفاصيل الشحن</b>\n\n"
+            f"📞 الكود: <code>{context.user_data.get('topup_code')}</code>\n"
+            f"🆔 رقم التحويل: <code>{context.user_data.get('topup_ref')}</code>\n"
+            f"💰 المبلغ: <code>{amount:,.0f}</code> ليرة\n\n"
+            "هل البيانات صحيحة؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ نعم، تأكيد", callback_data="confirm_topup"),
+                    InlineKeyboardButton("❌ لا، إعادة", callback_data="cancel_topup")
+                ]
+            ])
+        )
+        return States.TOPUP_CONFIRM
+    except ValueError:
+        await update.message.reply_text(
+            "❌ المبلغ غير صحيح. الرجاء إدخال رقم.\n"
+            "مثال: 15000"
+        )
+        return States.TOPUP_SYRIA_AMOUNT
 
-        await update_order(storage, oid, {"status": ST_REJECTED})
-        await q.message.reply_text(TXT["admin_order_updated"].format(status=ST_REJECTED))
+async def topup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_topup":
+        user_id = query.from_user.id
+        
+        # Create pending request
+        request_id = generate_request_id()
+        pending_request = PendingRequest(
+            request_id=request_id,
+            user_id=user_id,
+            req_type="topup",
+            data={
+                "method": "syriatel",
+                "code": context.user_data.get("topup_code"),
+                "ref": context.user_data.get("topup_ref"),
+                "amount": context.user_data.get("topup_amount")
+            }
+        )
+        
+        pending = await DataManager.get_pending_requests()
+        pending[request_id] = pending_request
+        await DataManager.save_pending_requests(pending)
+        
+        # Notify admins
+        admin_message = (
+            f"🔄 <b>طلب شحن جديد</b>\n\n"
+            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+            f"👤 المستخدم: {user_id}\n"
+            f"📞 الكود: {context.user_data.get('topup_code')}\n"
+            f"🆔 رقم التحويل: {context.user_data.get('topup_ref')}\n"
+            f"💰 المبلغ: {context.user_data.get('topup_amount'):,.0f} ليرة\n"
+            f"📱 الطريقة: سيرياتيل كاش"
+        )
+        await send_to_admins(context, admin_message)
+        
+        await query.edit_message_text(
+            f"✅ <b>تم تقديم طلب الشحن بنجاح!</b>\n\n"
+            f"🆔 رقم طلبك: <code>{request_id}</code>\n"
+            f"💰 المبلغ: <code>{context.user_data.get('topup_amount'):,.0f}</code> ليرة\n\n"
+            "📨 تم إرسال الطلب للإدارة. سيتم التحقق وإضافة الرصيد قريباً.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Clear user data
+        context.user_data.clear()
+    else:
+        await query.edit_message_text("❌ تم إلغاء الطلب.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="⚡ اختر من القائمة:",
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
+
+# ==================== WITHDRAW FUNCTIONS ====================
+@require_subscription
+async def withdraw_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "➖ <b>سحب رصيد من البوت</b>\n\n"
+        "اختر طريقة السحب:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_withdraw_methods_keyboard()
+    )
+    return States.WITHDRAW_METHOD
+
+async def withdraw_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "withdraw_sham":
+        await query.edit_message_text(
+            "💳 <b>شام كاش</b>\n\n"
+            "📍 للسحب عبر شام كاش:\n"
+            "تواصل مع الدعم مباشرة:\n"
+            f"{SUPPORT_USERNAME}",
+            parse_mode=ParseMode.HTML
+        )
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    elif query.data == "withdraw_syriatel":
+        await query.edit_message_text(
+            "📲 <b>سيرياتيل كاش</b>\n\n"
+            "أدخل رقم سيرياتيل المستلم:"
+        )
+        return States.WITHDRAW_SYRIA_NUMBER
+
+async def withdraw_number_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone_number = update.message.text.strip()
+    
+    if not phone_number.isdigit() or len(phone_number) < 10:
+        await update.message.reply_text(
+            "❌ رقم الهاتف غير صحيح.\n"
+            "الرجاء إدخال رقم سيرياتيل صحيح:\n"
+            "مثال: 0991234567"
+        )
+        return States.WITHDRAW_SYRIA_NUMBER
+    
+    context.user_data["withdraw_phone"] = phone_number
+    
+    await update.message.reply_text(
+        f"📞 رقم المستلم: <code>{phone_number}</code>\n\n"
+        f"أدخل المبلغ بالليرة السورية:\n"
+        f"الحد الأدنى: {MIN_WITHDRAW:,} ليرة",
+        parse_mode=ParseMode.HTML
+    )
+    return States.WITHDRAW_SYRIA_AMOUNT
+
+async def withdraw_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text.strip())
+        user_id = update.effective_user.id
+        user = await DataManager.get_user(user_id)
+        
+        available_balance = user.balance - user.hold
+        
+        if amount < MIN_WITHDRAW:
+            await update.message.reply_text(
+                f"❌ المبلغ أقل من الحد الأدنى.\n"
+                f"الحد الأدنى: {MIN_WITHDRAW:,} ليرة\n\n"
+                "الرجاء إدخال مبلغ أكبر:"
+            )
+            return States.WITHDRAW_SYRIA_AMOUNT
+        
+        if amount > available_balance:
+            await update.message.reply_text(
+                f"❌ رصيدك غير كافي.\n"
+                f"💵 الرصيد المتاح: {available_balance:,.0f} ليرة\n"
+                f"💰 المطلوب: {amount:,.0f} ليرة\n\n"
+                "الرجاء إدخال مبلغ أقل:"
+            )
+            return States.WITHDRAW_SYRIA_AMOUNT
+        
+        context.user_data["withdraw_amount"] = amount
+        
+        await update.message.reply_text(
+            f"📋 <b>تفاصيل السحب</b>\n\n"
+            f"📞 رقم المستلم: <code>{context.user_data.get('withdraw_phone')}</code>\n"
+            f"💰 المبلغ: <code>{amount:,.0f}</code> ليرة\n\n"
+            f"💳 سيتم خصم: <code>{amount:,.0f}</code> ليرة من رصيدك\n\n"
+            "هل تريد المتابعة؟",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ نعم، تأكيد", callback_data="confirm_withdraw"),
+                    InlineKeyboardButton("❌ لا، إلغاء", callback_data="cancel_withdraw")
+                ]
+            ])
+        )
+        return States.WITHDRAW_CONFIRM
+    except ValueError:
+        await update.message.reply_text(
+            "❌ المبلغ غير صحيح. الرجاء إدخال رقم.\n"
+            "مثال: 500"
+        )
+        return States.WITHDRAW_SYRIA_AMOUNT
+
+async def withdraw_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_withdraw":
+        user_id = query.from_user.id
+        user = await DataManager.get_user(user_id)
+        amount = context.user_data.get("withdraw_amount")
+        
+        # Check balance again
+        available_balance = user.balance - user.hold
+        if amount > available_balance:
+            await query.edit_message_text("❌ رصيدك غير كافي.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚡ اختر من القائمة:",
+                reply_markup=get_main_keyboard()
+            )
+            return States.MAIN_MENU
+        
+        # Hold the amount
+        user.balance -= amount
+        user.hold += amount
+        await DataManager.save_user(user)
+        
+        # Create pending request
+        request_id = generate_request_id()
+        pending_request = PendingRequest(
+            request_id=request_id,
+            user_id=user_id,
+            req_type="withdraw",
+            data={
+                "method": "syriatel",
+                "phone": context.user_data.get("withdraw_phone"),
+                "amount": amount,
+                "hold_amount": amount
+            }
+        )
+        
+        pending = await DataManager.get_pending_requests()
+        pending[request_id] = pending_request
+        await DataManager.save_pending_requests(pending)
+        
+        # Notify admins
+        admin_message = (
+            f"🔄 <b>طلب سحب جديد</b>\n\n"
+            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+            f"👤 المستخدم: {user_id}\n"
+            f"📞 رقم المستلم: {context.user_data.get('withdraw_phone')}\n"
+            f"💰 المبلغ: {amount:,.0f} ليرة\n"
+            f"📱 الطريقة: سيرياتيل كاش\n"
+            f"🔒 <i>تم حجز المبلغ من رصيد المستخدم</i>"
+        )
+        await send_to_admins(context, admin_message)
+        
+        await query.edit_message_text(
+            f"✅ <b>تم تقديم طلب السحب بنجاح!</b>\n\n"
+            f"🆔 رقم طلبك: <code>{request_id}</code>\n"
+            f"💰 المبلغ: <code>{amount:,.0f}</code> ليرة\n"
+            f"📞 إلى رقم: <code>{context.user_data.get('withdraw_phone')}</code>\n\n"
+            f"🔒 <i>تم حجز المبلغ من رصيدك حتى معالجة الطلب</i>\n\n"
+            "📨 تم إرسال الطلب للإدارة. سيتم التحويل قريباً.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Clear user data
+        context.user_data.clear()
+    else:
+        await query.edit_message_text("❌ تم إلغاء الطلب.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="⚡ اختر من القائمة:",
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
+
+@require_subscription
+async def cancel_last_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    pending = await DataManager.get_pending_requests()
+    user_pending = []
+    
+    for req_id, req in pending.items():
+        if req.user_id == user_id and req.type == "withdraw" and req.status == "pending":
+            user_pending.append((req.created_at, req_id, req))
+    
+    if not user_pending:
+        await update.message.reply_text(
+            "❌ لا توجد طلبات سحب معلقة.",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    
+    # Get latest withdraw request
+    user_pending.sort(reverse=True)
+    latest_req = user_pending[0][2]
+    
+    # Check if it's within reasonable time (e.g., last 24 hours)
+    req_time = datetime.fromisoformat(latest_req.created_at)
+    time_diff = datetime.now() - req_time
+    
+    if time_diff.total_seconds() > 24 * 3600:  # 24 hours
+        await update.message.reply_text(
+            "❌ لا يمكن إلغاء الطلب بعد مرور 24 ساعة.",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    
+    await update.message.reply_text(
+        f"🧾 <b>إلغاء آخر طلب سحب</b>\n\n"
+        f"🆔 رقم الطلب: <code>{latest_req.request_id}</code>\n"
+        f"💰 المبلغ: <code>{latest_req.data.get('amount', 0):,.0f}</code> ليرة\n"
+        f"📞 إلى رقم: <code>{latest_req.data.get('phone', '')}</code>\n\n"
+        "هل تريد إلغاء هذا الطلب؟",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ نعم، ألغي", callback_data=f"cancel_req_{latest_req.request_id}"),
+                InlineKeyboardButton("❌ لا، احتفظ", callback_data="keep_request")
+            ]
+        ])
+    )
+    return States.MAIN_MENU
+
+async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("cancel_req_"):
+        request_id = query.data[11:]
+        
+        pending = await DataManager.get_pending_requests()
+        request = pending.get(request_id)
+        
+        if not request or request.status != "pending" or request.type != "withdraw":
+            await query.edit_message_text("❌ الطلب غير موجود أو تم معالجته بالفعل.")
+            return
+        
+        # Return held amount to user
+        user = await DataManager.get_user(request.user_id)
+        user.balance += request.data.get("amount", 0)
+        user.hold -= request.data.get("amount", 0)
+        
+        # Mark as cancelled
+        request.status = "cancelled"
+        request.handled_by = query.from_user.id
+        request.handled_at = datetime.now().isoformat()
+        
+        await DataManager.save_user(user)
+        await DataManager.save_pending_requests(pending)
+        
+        # Notify admins
+        admin_message = (
+            f"❌ <b>تم إلغاء طلب سحب</b>\n\n"
+            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+            f"👤 المستخدم: {request.user_id}\n"
+            f"👤 الملغي بواسطة: {query.from_user.id}\n"
+            f"💰 المبلغ: {request.data.get('amount', 0):,.0f} ليرة\n\n"
+            f"💵 <i>تم إرجاع المبلغ المحجوز إلى رصيد المستخدم</i>"
+        )
+        await send_to_admins(context, admin_message)
+        
+        await query.edit_message_text(
+            f"✅ <b>تم إلغاء طلب السحب بنجاح!</b>\n\n"
+            f"💰 تم إرجاع: <code>{request.data.get('amount', 0):,.0f}</code> ليرة إلى رصيدك\n"
+            f"💵 رصيدك الحالي: <code>{user.balance:,.0f}</code> ليرة",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await query.edit_message_text("❌ تم الإبقاء على الطلب.")
+    
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="⚡ اختر من القائمة:",
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
+
+@require_subscription
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆘 <b>الدعم الفني</b>\n\n"
+        f"للتواصل مع الدعم:\n"
+        f"👤 {SUPPORT_USERNAME}\n\n"
+        f"📞 تواصل معنا لحل أي مشكلة أو استفسار.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    return States.MAIN_MENU
+
+# ==================== ADMIN FUNCTIONS ====================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if not await is_admin(user_id):
+        await update.message.reply_text("❌ هذا القسم للأدمن فقط.")
+        return States.MAIN_MENU
+    
+    is_super = await is_super_admin(user_id)
+    
+    # Get statistics
+    users = await DataManager.get_all_users()
+    total_users = len(users)
+    active_users = len([u for u in users.values() if u.balance > 0 or u.eshansy_account])
+    
+    accounts = await DataManager.get_accounts()
+    total_accounts = len(accounts)
+    available_accounts = len([a for a in accounts.values() if not a.assigned_to])
+    
+    pending = await DataManager.get_pending_requests()
+    pending_count = len([r for r in pending.values() if r.status == "pending"])
+    
+    total_balance = sum(u.balance for u in users.values())
+    total_hold = sum(u.hold for u in users.values())
+    
+    message = (
+        f"⚙️ <b>لوحة الأدمن</b>\n\n"
+        f"📊 <b>الإحصائيات:</b>\n"
+        f"👥 إجمالي المستخدمين: {total_users}\n"
+        f"👤 المستخدمين النشطين: {active_users}\n"
+        f"💼 حسابات ايشانسي: {total_accounts}\n"
+        f"🆓 حسابات متاحة: {available_accounts}\n"
+        f"📨 الطلبات المعلقة: {pending_count}\n"
+        f"💰 إجمالي الأرصدة: {total_balance:,.0f} ليرة\n"
+        f"🔒 إجمالي المحجوز: {total_hold:,.0f} ليرة\n\n"
+        f"🛠️ اختر من القائمة:"
+    )
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_keyboard(is_super)
+    )
+    
+    context.user_data["admin_mode"] = True
+    return States.MAIN_MENU
+
+async def admin_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("admin_mode"):
+        return await handle_message(update, context)
+    
+    text = update.message.text
+    
+    if text.startswith("📊 الإحصائيات"):
+        return await admin_panel(update, context)
+    elif text.startswith("👥 المستخدمين"):
+        return await admin_search_user(update, context)
+    elif text.startswith("📨 الطلبات المعلقة"):
+        return await admin_pending_requests(update, context)
+    elif text.startswith("⚙️ إعدادات"):
+        return await admin_settings(update, context)
+    elif text.startswith("📢 رسالة جماعية"):
+        return await admin_broadcast_start(update, context)
+    elif text.startswith("💾 Backup/Restore"):
+        return await admin_backup_restore(update, context)
+    elif text.startswith("🔧 الصيانة"):
+        return await admin_maintenance(update, context)
+    else:
+        await update.message.reply_text(
+            "⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        return States.MAIN_MENU
+
+async def admin_pending_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = await DataManager.get_pending_requests()
+    pending_list = [r for r in pending.values() if r.status == "pending"]
+    
+    if not pending_list:
+        await update.message.reply_text(
+            "✅ لا توجد طلبات معلقة حالياً.",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        return States.MAIN_MENU
+    
+    # Group by type
+    requests_by_type = {}
+    for req in pending_list:
+        if req.type not in requests_by_type:
+            requests_by_type[req.type] = []
+        requests_by_type[req.type].append(req)
+    
+    message = "📨 <b>الطلبات المعلقة</b>\n\n"
+    
+    for req_type, reqs in requests_by_type.items():
+        type_name = {
+            "topup": "شحن رصيد",
+            "withdraw": "سحب رصيد",
+            "eshansy_topup": "شحن ايشانسي",
+            "eshansy_withdraw": "سحب ايشانسي"
+        }.get(req_type, req_type)
+        
+        message += f"📌 <b>{type_name}:</b> {len(reqs)} طلب\n"
+    
+    message += "\nاختر نوع الطلبات لعرضها:"
+    
+    keyboard = []
+    for req_type in requests_by_type.keys():
+        type_name = {
+            "topup": "💳 شحن رصيد",
+            "withdraw": "💸 سحب رصيد",
+            "eshansy_topup": "💰 شحن ايشانسي",
+            "eshansy_withdraw": "💼 سحب ايشانسي"
+        }.get(req_type, req_type)
+        
+        keyboard.append([InlineKeyboardButton(type_name, callback_data=f"admin_show_{req_type}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return States.MAIN_MENU
+
+async def admin_show_requests_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "admin_back":
+        await query.edit_message_text(
+            "⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+        )
+        return
+    
+    req_type = query.data[11:]  # Remove "admin_show_"
+    
+    pending = await DataManager.get_pending_requests()
+    requests = [r for r in pending.values() if r.status == "pending" and r.type == req_type]
+    
+    if not requests:
+        await query.edit_message_text(
+            f"✅ لا توجد طلبات من نوع {req_type}.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_requests")]
+            ])
+        )
+        return
+    
+    # Show first request
+    req = requests[0]
+    context.user_data["current_request_index"] = 0
+    context.user_data["current_requests"] = [r.request_id for r in requests]
+    
+    await show_request_detail(query, context, req)
+
+async def show_request_detail(query, context, req):
+    user = await DataManager.get_user(req.user_id)
+    
+    type_name = {
+        "topup": "💳 طلب شحن رصيد",
+        "withdraw": "💸 طلب سحب رصيد",
+        "eshansy_topup": "💰 طلب شحن ايشانسي",
+        "eshansy_withdraw": "💼 طلب سحب ايشانسي"
+    }.get(req.type, req.type)
+    
+    message = f"{type_name}\n\n"
+    message += f"🆔 رقم الطلب: <code>{req.request_id}</code>\n"
+    message += f"👤 المستخدم: <code>{req.user_id}</code>\n"
+    message += f"📅 التاريخ: {req.created_at}\n\n"
+    
+    if req.type == "topup":
+        message += (
+            f"📱 الطريقة: سيرياتيل كاش\n"
+            f"📞 الكود: <code>{req.data.get('code')}</code>\n"
+            f"🆔 رقم التحويل: <code>{req.data.get('ref')}</code>\n"
+            f"💰 المبلغ: <code>{req.data.get('amount', 0):,.0f}</code> ليرة\n"
+        )
+    elif req.type == "withdraw":
+        message += (
+            f"📱 الطريقة: سيرياتيل كاش\n"
+            f"📞 رقم المستلم: <code>{req.data.get('phone')}</code>\n"
+            f"💰 المبلغ: <code>{req.data.get('amount', 0):,.0f}</code> ليرة\n"
+            f"🔒 المبلغ المحجوز: <code>{req.data.get('hold_amount', 0):,.0f}</code> ليرة\n"
+        )
+    elif req.type == "eshansy_topup":
+        message += (
+            f"👤 حساب ايشانسي: <code>{req.data.get('username')}</code>\n"
+            f"💰 المبلغ: <code>{req.data.get('amount_sy', 0):,.0f}</code> ليرة\n"
+            f"🎯 النقاط: <code>{req.data.get('eshansy_points', 0):,}</code> نقطة\n"
+        )
+    elif req.type == "eshansy_withdraw":
+        message += (
+            f"👤 حساب ايشانسي: <code>{req.data.get('username')}</code>\n"
+            f"🎯 النقاط: <code>{req.data.get('points', 0):,}</code> نقطة\n"
+            f"💰 المبلغ: <code>{req.data.get('amount_sy', 0):,.0f}</code> ليرة\n"
+        )
+    
+    message += f"\n💵 رصيد المستخدم: <code>{user.balance:,.0f}</code> ليرة"
+    if user.eshansy_account:
+        message += f"\n💼 رصيد ايشانسي: <code>{user.eshansy_balance:,}</code> نقطة"
+    
+    keyboard = get_pending_actions_keyboard(req.request_id)
+    
+    # Add navigation if multiple requests
+    current_index = context.user_data.get("current_request_index", 0)
+    requests_list = context.user_data.get("current_requests", [])
+    
+    if len(requests_list) > 1:
+        nav_buttons = []
+        if current_index > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"admin_nav_{current_index-1}"))
+        if current_index < len(requests_list) - 1:
+            nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"admin_nav_{current_index+1}"))
+        
+        if nav_buttons:
+            keyboard.inline_keyboard.append(nav_buttons)
+    
+    await query.edit_message_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+async def admin_request_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("admin_nav_"):
+        index = int(query.data[10:])
+        context.user_data["current_request_index"] = index
+        
+        request_id = context.user_data["current_requests"][index]
+        pending = await DataManager.get_pending_requests()
+        req = pending.get(request_id)
+        
+        if req:
+            await show_request_detail(query, context, req)
+        return
+    
+    if query.data.startswith("approve_"):
+        request_id = query.data[8:]
+        await handle_approve_request(query, context, request_id)
+    elif query.data.startswith("reject_"):
+        request_id = query.data[7:]
+        await handle_reject_request(query, context, request_id)
+    elif query.data.startswith("edit_"):
+        request_id = query.data[5:]
+        await handle_edit_request(query, context, request_id)
+
+async def handle_approve_request(query, context, request_id):
+    pending = await DataManager.get_pending_requests()
+    request = pending.get(request_id)
+    
+    if not request or request.status != "pending":
+        await query.answer("❌ الطلب غير موجود أو تم معالجته بالفعل.", show_alert=True)
+        return
+    
+    user = await DataManager.get_user(request.user_id)
+    
+    if request.type == "topup":
+        # Add balance to user
+        user.balance += request.data.get("amount", 0)
+        await DataManager.save_user(user)
+        
+        # Notify user
         try:
-            await context.bot.send_message(chat_id=user_id, text=TXT["user_rejected"].format(id=oid))
-        except Exception:
+            await context.bot.send_message(
+                chat_id=request.user_id,
+                text=f"✅ <b>تمت الموافقة على طلب الشحن!</b>\n\n"
+                     f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+                     f"💰 المبلغ: <code>{request.data.get('amount', 0):,.0f}</code> ليرة\n"
+                     f"💵 تم إضافة المبلغ إلى رصيدك.\n"
+                     f"💰 رصيدك الحالي: <code>{user.balance:,.0f}</code> ليرة",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
+    
+    elif request.type == "withdraw":
+        # Keep hold amount as is (already held during request)
+        # Just mark as approved
+        pass
+    
+    elif request.type == "eshansy_topup":
+        # Already processed during request creation
+        pass
+    
+    elif request.type == "eshansy_withdraw":
+        # Deduct from eshansy balance and add to user balance
+        if user.eshansy_balance >= request.data.get("points", 0):
+            user.eshansy_balance -= request.data.get("points", 0)
+            user.balance += request.data.get("amount_sy", 0)
+            await DataManager.save_user(user)
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=request.user_id,
+                    text=f"✅ <b>تمت الموافقة على سحب ايشانسي!</b>\n\n"
+                         f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+                         f"🎯 النقاط المسحوبة: <code>{request.data.get('points', 0):,}</code>\n"
+                         f"💰 المبلغ المضاف: <code>{request.data.get('amount_sy', 0):,.0f}</code> ليرة\n"
+                         f"💰 رصيدك الحالي: <code>{user.balance:,.0f}</code> ليرة",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user: {e}")
+    
+    # Update request status
+    request.status = "approved"
+    request.handled_by = query.from_user.id
+    request.handled_at = datetime.now().isoformat()
+    
+    await DataManager.save_pending_requests(pending)
+    
+    # Remove from current view
+    requests_list = context.user_data.get("current_requests", [])
+    if request_id in requests_list:
+        requests_list.remove(request_id)
+        context.user_data["current_requests"] = requests_list
+    
+    # Show next request or go back
+    if requests_list:
+        next_index = min(context.user_data.get("current_request_index", 0), len(requests_list)-1)
+        context.user_data["current_request_index"] = next_index
+        next_request_id = requests_list[next_index]
+        next_req = pending.get(next_request_id)
+        
+        if next_req:
+            await show_request_detail(query, context, next_req)
+        else:
+            await query.edit_message_text(
+                "✅ تمت الموافقة على الطلب.\n\n"
+                "⚙️ اختر من قائمة الأدمن:",
+                reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+            )
+    else:
+        await query.edit_message_text(
+            "✅ تمت الموافقة على الطلب.\n\n"
+            "⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+        )
+
+async def handle_reject_request(query, context, request_id):
+    pending = await DataManager.get_pending_requests()
+    request = pending.get(request_id)
+    
+    if not request or request.status != "pending":
+        await query.answer("❌ الطلب غير موجود أو تم معالجته بالفعل.", show_alert=True)
+        return
+    
+    user = await DataManager.get_user(request.user_id)
+    
+    if request.type == "withdraw":
+        # Return held amount to available balance
+        user.balance += request.data.get("amount", 0)
+        user.hold -= request.data.get("amount", 0)
+        await DataManager.save_user(user)
+        
+        try:
+            await context.bot.send_message(
+                chat_id=request.user_id,
+                text=f"❌ <b>تم رفض طلب السحب</b>\n\n"
+                     f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+                     f"💰 المبلغ: <code>{request.data.get('amount', 0):,.0f}</code> ليرة\n"
+                     f"💵 تم إرجاع المبلغ المحجوز إلى رصيدك.\n"
+                     f"💰 رصيدك الحالي: <code>{user.balance:,.0f}</code> ليرة\n\n"
+                     f"📍 للاستفسار: {SUPPORT_USERNAME}",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
+    
+    elif request.type == "eshansy_withdraw":
+        # Just reject, no balance changes needed
+        try:
+            await context.bot.send_message(
+                chat_id=request.user_id,
+                text=f"❌ <b>تم رفض طلب سحب ايشانسي</b>\n\n"
+                     f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+                     f"🎯 النقاط: <code>{request.data.get('points', 0):,}</code>\n\n"
+                     f"📍 للاستفسار: {SUPPORT_USERNAME}",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
+    
+    # Update request status
+    request.status = "rejected"
+    request.handled_by = query.from_user.id
+    request.handled_at = datetime.now().isoformat()
+    
+    await DataManager.save_pending_requests(pending)
+    
+    # Remove from current view
+    requests_list = context.user_data.get("current_requests", [])
+    if request_id in requests_list:
+        requests_list.remove(request_id)
+        context.user_data["current_requests"] = requests_list
+    
+    # Show next request or go back
+    if requests_list:
+        next_index = min(context.user_data.get("current_request_index", 0), len(requests_list)-1)
+        context.user_data["current_request_index"] = next_index
+        next_request_id = requests_list[next_index]
+        next_req = pending.get(next_request_id)
+        
+        if next_req:
+            await show_request_detail(query, context, next_req)
+        else:
+            await query.edit_message_text(
+                "❌ تم رفض الطلب.\n\n"
+                "⚙️ اختر من قائمة الأدمن:",
+                reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+            )
+    else:
+        await query.edit_message_text(
+            "❌ تم رفض الطلب.\n\n"
+            "⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+        )
+
+async def handle_edit_request(query, context, request_id):
+    await query.answer("⚠️ هذه الميزة قيد التطوير", show_alert=True)
+
+async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_super = await is_super_admin(user_id)
+    
+    message = "⚙️ <b>إعدادات الأدمن</b>\n\n"
+    
+    if is_super:
+        message += "👑 <b>أنت أدمن رئيسي</b>\n\n"
+        message += "🔧 <b>الخيارات المتاحة:</b>\n"
+        message += "1️⃣ تعديل رصيد مستخدم\n"
+        message += "2️⃣ إضافة حساب ايشانسي\n"
+        message += "3️⃣ حذف حساب ايشانسي\n"
+        message += "4️⃣ تعيين أدمن مساعد\n"
+        message += "5️⃣ إزالة أدمن مساعد\n"
+    else:
+        message += "👨‍💼 <b>أنت أدمن مساعد</b>\n\n"
+        message += "🔧 <b>الخيارات المتاحة:</b>\n"
+        message += "1️⃣ عرض طلبات المستخدمين\n"
+        message += "2️⃣ قبول/رفض الطلبات\n"
+    
+    keyboard = []
+    if is_super:
+        keyboard.append([InlineKeyboardButton("➕ إضافة حساب ايشانسي", callback_data="admin_add_account")])
+        keyboard.append([InlineKeyboardButton("➖ حذف حساب ايشانسي", callback_data="admin_delete_account")])
+        keyboard.append([InlineKeyboardButton("💰 تعديل رصيد مستخدم", callback_data="admin_modify_balance")])
+        keyboard.append([InlineKeyboardButton("👤 تعيين أدمن مساعد", callback_data="admin_add_assistant")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return States.MAIN_MENU
+
+async def admin_backup_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_super_admin(user_id):
+        await update.message.reply_text("❌ هذه الميزة للأدمن الرئيسي فقط.")
+        return States.MAIN_MENU
+    
+    # Create backup directory if not exists
+    BACKUP_DIR.mkdir(exist_ok=True)
+    
+    # List existing backups
+    backups = list(BACKUP_DIR.glob("*.zip"))
+    
+    message = "💾 <b>Backup / Restore</b>\n\n"
+    
+    if backups:
+        message += "📁 <b>النسخ الاحتياطية المتاحة:</b>\n"
+        for backup in backups[-5:]:  # Show last 5 backups
+            size = backup.stat().st_size / 1024  # Size in KB
+            message += f"• {backup.name} ({size:.1f} KB)\n"
+    else:
+        message += "❌ لا توجد نسخ احتياطية.\n"
+    
+    message += "\n🔧 اختر الإجراء:"
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 إنشاء Backup", callback_data="admin_backup")],
+        [InlineKeyboardButton("📤 Restore من ملف", callback_data="admin_restore")]
+    ]
+    
+    if backups:
+        keyboard.append([InlineKeyboardButton("🗑️ حذف جميع النسخ", callback_data="admin_delete_backups")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+    
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return States.MAIN_MENU
+
+async def admin_backup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "admin_backup":
+        try:
+            # Create backup
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = BACKUP_DIR / f"backup_{timestamp}.zip"
+            
+            with zipfile.ZipFile(backup_file, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add all JSON files
+                for file_path in [USERS_FILE, ACCOUNTS_FILE, PENDING_FILE, ADMINS_FILE, MAINTENANCE_FILE]:
+                    if file_path.exists():
+                        zipf.write(file_path, file_path.name)
+            
+            # Send file
+            with open(backup_file, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=query.from_user.id,
+                    document=InputFile(f, filename=backup_file.name),
+                    caption=f"✅ تم إنشاء Backup بنجاح\n📁 {backup_file.name}"
+                )
+            
+            await query.edit_message_text(
+                "✅ تم إرسال ملف Backup إليك.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 رجوع", callback_data="admin_backup_restore")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Backup error: {e}")
+            await query.edit_message_text(
+                f"❌ حدث خطأ أثناء إنشاء Backup:\n{str(e)}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 رجوع", callback_data="admin_backup_restore")]
+                ])
+            )
+    elif query.data == "admin_restore":
+        await query.edit_message_text(
+            "📤 <b>استعادة من Backup</b>\n\n"
+            "⚠️ <b>تحذير:</b> سيتم تفعيل وضع الصيانة تلقائياً.\n"
+            "يرجى إرسال ملف ZIP الذي يحتوي على ملفات JSON.\n\n"
+            "❌ أرسل 'إلغاء' للإلغاء.",
+            parse_mode=ParseMode.HTML
+        )
+        context.user_data["awaiting_restore"] = True
+    elif query.data == "admin_delete_backups":
+        # Delete all backups
+        for backup in BACKUP_DIR.glob("*.zip"):
+            backup.unlink()
+        
+        await query.edit_message_text(
+            "✅ تم حذف جميع النسخ الاحتياطية.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_backup_restore")]
+            ])
+        )
+    elif query.data == "admin_backup_restore":
+        await query.edit_message_text(
+            "💾 اختر الإجراء:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 إنشاء Backup", callback_data="admin_backup")],
+                [InlineKeyboardButton("📤 Restore من ملف", callback_data="admin_restore")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+            ])
+        )
+
+async def admin_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_restore"):
+        return
+    
+    if update.message.text and update.message.text.strip().lower() == "إلغاء":
+        context.user_data.pop("awaiting_restore", None)
+        await update.message.reply_text(
+            "❌ تم إلغاء عملية الاستعادة.",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        return
+    
+    if not update.message.document:
+        await update.message.reply_text("❌ يرجى إرسال ملف ZIP.")
+        return
+    
+    if not update.message.document.file_name.endswith('.zip'):
+        await update.message.reply_text("❌ الملف يجب أن يكون بصيغة ZIP.")
+        return
+    
+    try:
+        # Enable maintenance mode
+        await DataManager.set_maintenance(True)
+        
+        # Download file
+        file = await context.bot.get_file(update.message.document.file_id)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        await file.download_to_drive(temp_file.name)
+        
+        # Extract and restore
+        with zipfile.ZipFile(temp_file.name, 'r') as zipf:
+            # Extract to temp directory
+            temp_dir = tempfile.mkdtemp()
+            zipf.extractall(temp_dir)
+            
+            # Restore files
+            for file_name in ["users.json", "accounts.json", "pending.json", "admins.json", "maintenance.json"]:
+                src = Path(temp_dir) / file_name
+                dst = Path(DATA_DIR) / file_name
+                if src.exists():
+                    shutil.copy(src, dst)
+        
+        # Cleanup
+        os.unlink(temp_file.name)
+        shutil.rmtree(temp_dir)
+        
+        await update.message.reply_text(
+            "✅ <b>تمت استعادة البيانات بنجاح!</b>\n\n"
+            "🔧 <b>ملاحظة:</b> وضع الصيانة مفعل.\n"
+            "يجب إغلاق وضع الصيانة يدوياً من لوحة الأدمن.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        
+        context.user_data.pop("awaiting_restore", None)
+        
+    except Exception as e:
+        logger.error(f"Restore error: {e}")
+        await update.message.reply_text(
+            f"❌ حدث خطأ أثناء الاستعادة:\n{str(e)}",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        await DataManager.set_maintenance(False)
+
+async def admin_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_super_admin(user_id):
+        await update.message.reply_text("❌ هذه الميزة للأدمن الرئيسي فقط.")
+        return States.MAIN_MENU
+    
+    is_maintenance = await DataManager.is_maintenance()
+    
+    status = "🟢 <b>مفعّل</b>" if is_maintenance else "🔴 <b>معطّل</b>"
+    
+    await update.message.reply_text(
+        f"🔧 <b>وضع الصيانة</b>\n\n"
+        f"الحالة الحالية: {status}\n\n"
+        "في وضع الصيانة:\n"
+        "• لا يستطيع المستخدمون استخدام البوت\n"
+        "• الأدمن فقط يمكنهم الوصول\n\n"
+        "اختر الإجراء:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ تفعيل الصيانة", callback_data="maintenance_on"),
+                InlineKeyboardButton("❌ تعطيل الصيانة", callback_data="maintenance_off")
+            ],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+        ])
+    )
+    return States.MAIN_MENU
+
+async def maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "maintenance_on":
+        await DataManager.set_maintenance(True)
+        status = "✅ <b>تم تفعيل وضع الصيانة</b>"
+    else:
+        await DataManager.set_maintenance(False)
+        status = "❌ <b>تم تعطيل وضع الصيانة</b>"
+    
+    await query.edit_message_text(
+        f"{status}\n\n"
+        f"⚙️ اختر من قائمة الأدمن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+    )
+
+async def admin_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👥 <b>بحث عن مستخدم</b>\n\n"
+        "أدخل أي من المعلومات التالية:\n"
+        "• رقم المستخدم (User ID)\n"
+        "• اسم مستخدم ايشانسي\n"
+        "• جزء من اسم مستخدم ايشانسي\n\n"
+        "أو أرسل 'الكل' لعرض جميع المستخدمين.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    context.user_data["admin_search"] = True
+    return States.ADMIN_SEARCH_USER
+
+async def admin_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    search_term = update.message.text.strip()
+    
+    users = await DataManager.get_all_users()
+    
+    if search_term.lower() == "الكل":
+        # Show all users with pagination
+        user_list = list(users.values())
+        user_list.sort(key=lambda x: x.user_id)
+        
+        if not user_list:
+            await update.message.reply_text("❌ لا يوجد مستخدمون.")
+            return States.MAIN_MENU
+        
+        context.user_data["search_results"] = user_list
+        context.user_data["search_index"] = 0
+        
+        await show_user_detail(update, context, user_list[0])
+        return States.ADMIN_SEARCH_USER
+    
+    # Search by user ID
+    if search_term.isdigit():
+        user_id = int(search_term)
+        user = users.get(user_id)
+        if user:
+            await show_user_detail(update, context, user)
+            return States.ADMIN_SEARCH_USER
+    
+    # Search by eshansy username
+    results = []
+    for user in users.values():
+        if user.eshansy_account and search_term.lower() in user.eshansy_account.lower():
+            results.append(user)
+    
+    if not results:
+        await update.message.reply_text(
+            "❌ لم يتم العثور على مستخدمين.",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        return States.MAIN_MENU
+    
+    if len(results) == 1:
+        await show_user_detail(update, context, results[0])
+    else:
+        context.user_data["search_results"] = results
+        context.user_data["search_index"] = 0
+        
+        await show_user_detail(update, context, results[0])
+    
+    return States.ADMIN_SEARCH_USER
+
+async def show_user_detail(update, context, user):
+    message = (
+        f"👤 <b>معلومات المستخدم</b>\n\n"
+        f"🆔 الرقم: <code>{user.user_id}</code>\n"
+        f"📅 تاريخ الإنشاء: {user.created_at}\n"
+        f"✅ مشترك في القناة: {'نعم' if user.subscribed else 'لا'}\n"
+        f"👑 أدمن: {'نعم' if user.is_admin else 'لا'}\n"
+        f"👑 أدمن رئيسي: {'نعم' if user.is_super_admin else 'لا'}\n\n"
+        f"💰 <b>المحفظة</b>\n"
+        f"💵 الرصيد: <code>{user.balance:,.0f}</code> ليرة\n"
+        f"🔒 المحجوز: <code>{user.hold:,.0f}</code> ليرة\n"
+        f"⚖️ الإجمالي: <code>{user.balance + user.hold:,.0f}</code> ليرة\n"
+    )
+    
+    if user.eshansy_account:
+        message += (
+            f"\n💼 <b>حساب ايشانسي</b>\n"
+            f"👤 الحساب: <code>{user.eshansy_account}</code>\n"
+            f"💰 الرصيد: <code>{user.eshansy_balance:,}</code> نقطة\n"
+        )
+    
+    keyboard = []
+    
+    # Navigation buttons if there are multiple results
+    results = context.user_data.get("search_results", [])
+    current_index = context.user_data.get("search_index", 0)
+    
+    if len(results) > 1:
+        nav_buttons = []
+        if current_index > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"user_nav_{current_index-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"{current_index+1}/{len(results)}", callback_data="noop"))
+        if current_index < len(results) - 1:
+            nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"user_nav_{current_index+1}"))
+        
+        keyboard.append(nav_buttons)
+    
+    # Action buttons for super admin
+    if await is_super_admin(update.effective_user.id):
+        keyboard.append([
+            InlineKeyboardButton("💰 تعديل الرصيد", callback_data=f"user_edit_{user.user_id}"),
+            InlineKeyboardButton("👑 صلاحيات", callback_data=f"user_perms_{user.user_id}")
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton("📨 رسالة للمستخدم", callback_data=f"user_msg_{user.user_id}"),
+        InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_search")
+    ])
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def admin_user_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "noop":
+        return
+    
+    if query.data.startswith("user_nav_"):
+        index = int(query.data[9:])
+        context.user_data["search_index"] = index
+        
+        results = context.user_data.get("search_results", [])
+        if 0 <= index < len(results):
+            await show_user_detail(update, context, results[index])
+    
+    elif query.data == "admin_back_search":
+        await query.edit_message_text(
+            "⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+        )
+
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📢 <b>رسالة جماعية</b>\n\n"
+        "أرسل الرسالة التي تريد إرسالها لجميع المستخدمين.\n"
+        "يمكن أن تكون:\n"
+        "• نص\n"
+        "• صورة مع تعليق\n"
+        "• فيديو مع تعليق\n\n"
+        "❌ أرسل 'إلغاء' للإلغاء.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    context.user_data["broadcast_mode"] = True
+    return States.ADMIN_BROADCAST
+
+async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("broadcast_mode"):
+        return
+    
+    if update.message.text and update.message.text.strip().lower() == "إلغاء":
+        context.user_data.pop("broadcast_mode", None)
+        await update.message.reply_text(
+            "❌ تم إلغاء الرسالة الجماعية.",
+            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+        )
+        return
+    
+    context.user_data["broadcast_message"] = update.message
+    
+    # Ask for confirmation
+    await update.message.reply_text(
+        "✅ <b>تم استلام الرسالة</b>\n\n"
+        "هل تريد إرسالها لجميع المستخدمين؟\n\n"
+        f"👥 عدد المستخدمين: {len(await DataManager.get_all_users())}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ نعم، أرسل", callback_data="confirm_broadcast"),
+                InlineKeyboardButton("❌ لا، ألغي", callback_data="cancel_broadcast")
+            ]
+        ])
+    )
+    
+    return States.ADMIN_BROADCAST_CONFIRM
+
+async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel_broadcast":
+        await query.edit_message_text("❌ تم إلغاء الرسالة الجماعية.")
+        context.user_data.pop("broadcast_mode", None)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚙️ اختر من قائمة الأدمن:",
+            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+        )
+        return
+    
+    # Start broadcasting
+    await query.edit_message_text("🔄 <b>جاري إرسال الرسالة...</b>", parse_mode=ParseMode.HTML)
+    
+    users = await DataManager.get_all_users()
+    success = 0
+    failed = 0
+    
+    broadcast_msg = context.user_data.get("broadcast_message")
+    
+    for user_id, user in users.items():
+        try:
+            if broadcast_msg.text:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=broadcast_msg.text,
+                    parse_mode=ParseMode.HTML if broadcast_msg.parse_mode else None
+                )
+            elif broadcast_msg.photo:
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=broadcast_msg.photo[-1].file_id,
+                    caption=broadcast_msg.caption,
+                    parse_mode=ParseMode.HTML if broadcast_msg.caption_entities else None
+                )
+            elif broadcast_msg.video:
+                await context.bot.send_video(
+                    chat_id=user_id,
+                    video=broadcast_msg.video.file_id,
+                    caption=broadcast_msg.caption,
+                    parse_mode=ParseMode.HTML if broadcast_msg.caption_entities else None
+                )
+            
+            success += 1
+            await asyncio.sleep(0.05)  # Rate limiting
+            
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user_id}: {e}")
+            failed += 1
+    
+    await query.edit_message_text(
+        f"✅ <b>تم إرسال الرسالة بنجاح</b>\n\n"
+        f"📊 <b>النتائج:</b>\n"
+        f"✅ الناجح: {success}\n"
+        f"❌ الفاشل: {failed}\n"
+        f"👥 الإجمالي: {success + failed}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    context.user_data.pop("broadcast_mode", None)
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="⚙️ اختر من قائمة الأدمن:",
+        reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+    )
+
+async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await query.edit_message_text(
+        "⚙️ اختر من قائمة الأدمن:",
+        reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+    )
+    return States.MAIN_MENU
+
+async def admin_back_requests_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    await admin_pending_requests(update, context)
+
+# ==================== ERROR HANDLER ====================
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception occurred:", exc_info=context.error)
+    
+    if update and update.effective_user:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="❌ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى."
+            )
+        except:
             pass
 
-    except Exception:
-        logger.exception("Reject failed")
-        await q.message.reply_text("❌ تعذر رفض الطلب بسبب خطأ.")
-
-# ----- inventory (super) -----
-
-async def admin_inventory_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["admin_menu"], reply_markup=kb_admin())
-        return AD_MENU
-
-    if text == "➕ إضافة حساب":
-        await update.message.reply_text(TXT["inv_add_prompt"], reply_markup=kb_back_only())
-        return AD_INV_ADD
-
-    if text == "📋 إحصائيات":
-        a, b = await inv_stats(storage)
-        await update.message.reply_text(TXT["inv_list"].format(a=a, b=b), reply_markup=kb_inventory())
-        return AD_INV_MENU
-
-    if text == "🗑️ حذف حساب":
-        await update.message.reply_text(TXT["inv_delete_prompt"], reply_markup=kb_back_only())
-        return AD_INV_DELETE
-
-    await update.message.reply_text("⚠️ اختر خيار من مخزون ايشانسي 👇", reply_markup=kb_inventory())
-    return AD_INV_MENU
-
-async def admin_inventory_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        return AD_MENU
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["inv_menu"], reply_markup=kb_inventory())
-        return AD_INV_MENU
-
-    if "," not in text:
-        await update.message.reply_text("⚠️ الصيغة: username,password", reply_markup=kb_back_only())
-        return AD_INV_ADD
-
-    u, p = [safe_str(x, 128) for x in text.split(",", 1)]
-    if len(u) < 3 or len(p) < 3:
-        await update.message.reply_text("⚠️ قيم غير صحيحة.", reply_markup=kb_back_only())
-        return AD_INV_ADD
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    await inv_add(storage, u, p)
-    await update.message.reply_text(TXT["inv_added"], reply_markup=kb_inventory())
-    return AD_INV_MENU
-
-async def admin_inventory_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        return AD_MENU
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["inv_menu"], reply_markup=kb_inventory())
-        return AD_INV_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    ok = await inv_delete_by_username(storage, text)
-    await update.message.reply_text(TXT["inv_deleted"] if ok else TXT["inv_not_found"], reply_markup=kb_inventory())
-    return AD_INV_MENU
-
-# ----- assistants (super) -----
-
-async def admin_assist_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    text = (update.message.text or "").strip()
-
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["admin_menu"], reply_markup=kb_admin())
-        return AD_MENU
-
-    if text == "➕ إضافة مساعد":
-        await update.message.reply_text(TXT["admin_add_assist_prompt"], reply_markup=kb_back_only())
-        return AD_AS_ADD
-
-    if text == "➖ حذف مساعد":
-        await update.message.reply_text(TXT["admin_remove_assist_prompt"], reply_markup=kb_back_only())
-        return AD_AS_REMOVE
-
-    if text == "📋 عرض المساعدين":
-        ids = sorted(list(await get_assist_admins(storage)))
-        lines = "\n".join([f"• `{i}`" for i in ids]) if ids else "— لا يوجد —"
-        await update.message.reply_text(TXT["admin_assist_list"].format(list=lines), reply_markup=kb_admin_assist())
-        return AD_AS_MENU
-
-    await update.message.reply_text("⚠️ اختر خيار 👇", reply_markup=kb_admin_assist())
-    return AD_AS_MENU
-
-async def admin_assist_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        return AD_MENU
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["admin_manage_assist"], reply_markup=kb_admin_assist())
-        return AD_AS_MENU
-
-    uid = extract_user_id_from_message(update)
-    if not uid:
-        await update.message.reply_text("⚠️ أرسل ID رقمي أو حوّل رسالة منه 👇", reply_markup=kb_back_only())
-        return AD_AS_ADD
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    data = await storage.read("admins.json", {"assist_admin_ids": []})
-    ids = set(int(x) for x in data.get("assist_admin_ids", []) if isinstance(x, int) or str(x).isdigit())
-    ids.add(int(uid))
-    data["assist_admin_ids"] = sorted(list(ids))
-    await storage.write("admins.json", data)
-
-    await update.message.reply_text(TXT["admin_assist_added"], reply_markup=kb_admin_assist())
-    return AD_AS_MENU
-
-async def admin_assist_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        return AD_MENU
-
-    text = (update.message.text or "").strip()
-    if text == "⬅️ رجوع":
-        await update.message.reply_text(TXT["admin_manage_assist"], reply_markup=kb_admin_assist())
-        return AD_AS_MENU
-
-    uid = parse_int(text)
-    if not uid:
-        await update.message.reply_text("⚠️ أرسل ID رقمي صحيح 👇", reply_markup=kb_back_only())
-        return AD_AS_REMOVE
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    data = await storage.read("admins.json", {"assist_admin_ids": []})
-    ids = [int(x) for x in data.get("assist_admin_ids", []) if isinstance(x, int) or str(x).isdigit()]
-    ids = [i for i in ids if i != int(uid)]
-    data["assist_admin_ids"] = ids
-    await storage.write("admins.json", data)
-
-    await update.message.reply_text(TXT["admin_assist_removed"], reply_markup=kb_admin_assist())
-    return AD_AS_MENU
-
-# ----- broadcast (super) -----
-
-async def admin_broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    storage: JSONStorage = context.application.bot_data["storage"]
-    users = await storage.read("users.json", {})
-    user_ids = [int(v.get("id")) for v in users.values() if isinstance(v, dict) and v.get("id")]
-
-    ok = 0
-    bad = 0
-
-    msg = update.message
-    text = msg.text if msg.text else None
-    photo = msg.photo[-1] if msg.photo else None
-    video = msg.video if msg.video else None
-    caption = msg.caption
-
-    for uid in user_ids:
-        try:
-            if text and not photo and not video:
-                await context.bot.send_message(chat_id=uid, text=text)
-            elif photo:
-                await context.bot.send_photo(chat_id=uid, photo=photo.file_id, caption=caption)
-            elif video:
-                await context.bot.send_video(chat_id=uid, video=video.file_id, caption=caption)
-            else:
-                bad += 1
-                continue
-            ok += 1
-            await asyncio.sleep(0.06)
-        except RetryAfter as e:
-            await safe_sleep_for_flood(e)
-        except (Forbidden, TimedOut, NetworkError):
-            bad += 1
-        except Exception:
-            bad += 1
-
-    await update.message.reply_text(TXT["admin_broadcast_done"].format(ok=ok, bad=bad), reply_markup=kb_admin())
-    return AD_MENU
-
-# ----- backup/restore/maintenance -----
-
-async def set_maintenance(context: ContextTypes.DEFAULT_TYPE, on: bool) -> None:
-    storage: JSONStorage = context.application.bot_data["storage"]
-    s = await storage.read("settings.json", {"maintenance": False})
-    s["maintenance"] = bool(on)
-    await storage.write("settings.json", s)
-
-async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not is_super_admin(update, context):
-        return
-    cfg: Config = context.application.bot_data["cfg"]
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for fn in [
-            "users.json",
-            "wallet.json",
-            "orders.json",
-            "logs.json",
-            "settings.json",
-            "admins.json",
-            "ichancy_inventory.json",
-        ]:
-            p = os.path.join(cfg.DATA_DIR, fn)
-            if os.path.exists(p):
-                z.write(p, arcname=fn)
-    buf.seek(0)
-    await update.message.reply_document(document=buf, filename="backup.zip", caption=TXT["backup_ready"])
-
-async def admin_restore_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
-    if not is_super_admin(update, context):
-        await update.message.reply_text("⛔ هذه الميزة للسوبر أدمن فقط.")
-        return AD_MENU
-
-    msg = update.message
-    if not msg.document:
-        await msg.reply_text("⚠️ أرسل ملف ZIP كـ Document لو سمحت 👇")
-        return AD_RESTORE_WAIT
-
-    doc = msg.document
-    if not (doc.file_name or "").lower().endswith(".zip"):
-        await msg.reply_text(TXT["restore_bad"])
-        return AD_RESTORE_WAIT
-
-    cfg: Config = context.application.bot_data["cfg"]
-    storage: JSONStorage = context.application.bot_data["storage"]
-
-    try:
-        f = await context.bot.get_file(doc.file_id)
-        tmp_dir = tempfile.mkdtemp(prefix="restore_")
-        zip_path = os.path.join(tmp_dir, "backup.zip")
-        await f.download_to_drive(zip_path)
-
-        required = {
-            "users.json",
-            "wallet.json",
-            "orders.json",
-            "logs.json",
-            "settings.json",
-            "admins.json",
-            "ichancy_inventory.json",
-        }
-        with zipfile.ZipFile(zip_path, "r") as z:
-            names = set(z.namelist())
-            if not required.issubset(names):
-                await msg.reply_text(TXT["restore_bad"])
-                return AD_RESTORE_WAIT
-            extract_dir = os.path.join(tmp_dir, "ex")
-            os.makedirs(extract_dir, exist_ok=True)
-            z.extractall(extract_dir)
-
-        for fn in required:
-            p = os.path.join(extract_dir, fn)
-            with open(p, "r", encoding="utf-8") as r:
-                data = json.load(r)
-            await storage.write(fn, data)
-
-        await set_maintenance(context, True)  # keep ON
-        await msg.reply_text(TXT["restore_ok"], reply_markup=kb_admin())
-        return AD_MENU
-
-    except Exception:
-        logger.exception("Restore failed")
-        await msg.reply_text(TXT["restore_bad"])
-        return AD_RESTORE_WAIT
-
-# =========================
-# Global error handler
-# =========================
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error: %s", context.error)
-    try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text(TXT["try_again"])
-    except Exception:
-        pass
-
-# =========================
-# Build main application
-# =========================
-
-def main() -> None:
-    load_dotenv()
-    cfg = Config.from_env()
-    ok, msg = cfg.validate()
-    setup_logging(cfg.LOG_LEVEL)
-    if not ok:
-        logger.critical("❌ Invalid config: %s", msg)
-        raise SystemExit(1)
-
-    os.makedirs(cfg.DATA_DIR, exist_ok=True)
-    storage = JSONStorage(cfg.DATA_DIR)
-
-    app: Application = ApplicationBuilder().token(cfg.BOT_TOKEN).build()
-    app.bot_data["cfg"] = cfg
-    app.bot_data["storage"] = storage
-
-    # /start & subscription
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(cb_check_sub, pattern=f"^{CB_CHECK_SUB}$"))
-
-    # Confirm callbacks (unique patterns)
-    app.add_handler(CallbackQueryHandler(cb_topup_confirm, pattern=f"^({CB_TOPUP_OK}|{CB_TOPUP_NO})$"))
-    app.add_handler(CallbackQueryHandler(cb_withdraw_confirm, pattern=f"^({CB_WD_OK}|{CB_WD_NO})$"))
-    app.add_handler(CallbackQueryHandler(cb_ich_create_confirm, pattern=f"^({CB_ICH_CREATE_OK}|{CB_ICH_CREATE_NO})$"))
-    app.add_handler(CallbackQueryHandler(cb_ich_delete_confirm, pattern=f"^({CB_ICH_DEL_OK}|{CB_ICH_DEL_NO})$"))
-    app.add_handler(CallbackQueryHandler(cb_ich_topup_confirm, pattern=f"^({CB_ICH_TOPUP_OK}|{CB_ICH_TOPUP_NO})$"))
-    app.add_handler(CallbackQueryHandler(cb_ich_withdraw_confirm, pattern=f"^({CB_ICH_WD_OK}|{CB_ICH_WD_NO})$"))
-
-    # Admin order inline callbacks
-    app.add_handler(CallbackQueryHandler(admin_order_callbacks, pattern=r"^(ord_ok|ord_no|ord_edit):\d+$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_listener), group=1)
-
-    # User conversation
-    user_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, user_entry_router)],
+# ==================== MAIN FUNCTION ====================
+def main():
+    """Start the bot."""
+    # Create the Application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Conversation handler for main flow
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
         states={
-            ST_TOPUP_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_choose_method)],
-            ST_TOPUP_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_choose_code)],
-            ST_TOPUP_OP: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_get_op)],
-            ST_TOPUP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_get_amount)],
-            ST_TOPUP_CONFIRM: [],
-
-            ST_WD_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, wd_choose_method)],
-            ST_WD_RECEIVER: [MessageHandler(filters.TEXT & ~filters.COMMAND, wd_get_receiver)],
-            ST_WD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wd_get_amount)],
-            ST_WD_CONFIRM: [],
-
-            ST_ICH_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, ich_menu_handler)],
-            ST_ICH_CREATE_DESIRED: [MessageHandler(filters.TEXT & ~filters.COMMAND, ich_create_get_desired)],
-            ST_ICH_CREATE_CONFIRM: [],
-            ST_ICH_TOPUP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ich_topup_amount)],
-            ST_ICH_TOPUP_CONFIRM: [],
-            ST_ICH_WD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ich_withdraw_amount)],
-            ST_ICH_WD_CONFIRM: [],
-            ST_ICH_DEL_CONFIRM: [],
+            States.MAIN_MENU: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_message),
+                CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"),
+                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$"),
+                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$"),
+                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$"),
+                CallbackQueryHandler(eshansy_delete_callback, pattern="^confirm_delete_eshansy$|^cancel_delete_eshansy$"),
+                CallbackQueryHandler(topup_method_callback, pattern="^topup_|^code_|^back$"),
+                CallbackQueryHandler(topup_confirm_callback, pattern="^confirm_topup$|^cancel_topup$"),
+                CallbackQueryHandler(withdraw_method_callback, pattern="^withdraw_"),
+                CallbackQueryHandler(withdraw_confirm_callback, pattern="^confirm_withdraw$|^cancel_withdraw$"),
+                CallbackQueryHandler(cancel_withdraw_callback, pattern="^cancel_req_|^keep_request$"),
+                CallbackQueryHandler(admin_show_requests_callback, pattern="^admin_show_|^admin_back$"),
+                CallbackQueryHandler(admin_request_action_callback, pattern="^approve_|^reject_|^edit_|^admin_nav_"),
+                CallbackQueryHandler(admin_backup_callback, pattern="^admin_backup$|^admin_restore$|^admin_delete_backups$|^admin_backup_restore$"),
+                CallbackQueryHandler(maintenance_callback, pattern="^maintenance_"),
+                CallbackQueryHandler(broadcast_confirm_callback, pattern="^confirm_broadcast$|^cancel_broadcast$"),
+                CallbackQueryHandler(admin_user_nav_callback, pattern="^user_nav_|^admin_back_search$"),
+                CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"),
+                CallbackQueryHandler(admin_back_requests_callback, pattern="^admin_back_requests$")
+            ],
+            States.ESHANSY_MENU: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_menu_handler),
+                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$"),
+                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$"),
+                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$"),
+                CallbackQueryHandler(eshansy_delete_callback, pattern="^confirm_delete_eshansy$|^cancel_delete_eshansy$")
+            ],
+            States.ESHANSY_CREATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_create_account_handler),
+                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$")
+            ],
+            States.ESHANSY_TOPUP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_topup_handler),
+                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$")
+            ],
+            States.ESHANSY_WITHDRAW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_withdraw_handler),
+                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$")
+            ],
+            States.TOPUP_METHOD: [
+                CallbackQueryHandler(topup_method_callback)
+            ],
+            States.TOPUP_SYRIA_REF: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, topup_ref_handler)
+            ],
+            States.TOPUP_SYRIA_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, topup_amount_handler)
+            ],
+            States.TOPUP_CONFIRM: [
+                CallbackQueryHandler(topup_confirm_callback)
+            ],
+            States.WITHDRAW_METHOD: [
+                CallbackQueryHandler(withdraw_method_callback)
+            ],
+            States.WITHDRAW_SYRIA_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_number_handler)
+            ],
+            States.WITHDRAW_SYRIA_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount_handler)
+            ],
+            States.WITHDRAW_CONFIRM: [
+                CallbackQueryHandler(withdraw_confirm_callback)
+            ],
+            States.ADMIN_BROADCAST: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, admin_broadcast_handler)
+            ],
+            States.ADMIN_BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm_callback)
+            ],
+            States.ADMIN_SEARCH_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_handler),
+                CallbackQueryHandler(admin_user_nav_callback)
+            ]
         },
-        fallbacks=[],
-        name="user_conv",
-        persistent=False,
-        allow_reentry=True,
+        fallbacks=[
+            CommandHandler("start", start),
+            MessageHandler(filters.TEXT & filters.Regex("^🔙 رجوع$"), back_to_main)
+        ],
+        allow_reentry=True
     )
-    app.add_handler(user_conv, group=10)
+    
+    # Add handlers
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("admin", admin_panel))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+    
+    # Start the bot
+    print("🤖 البوت يعمل...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    # Admin conversation
-    admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", cmd_admin)],
-        states={
-            AD_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_menu_router)],
-            AD_FIND_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_find_user)],
-            AD_ADJUST_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_adjust_user_pick)],
-            AD_ADJUST_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_adjust_amount)],
-
-            AD_INV_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_inventory_router)],
-            AD_INV_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_inventory_add)],
-            AD_INV_DELETE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_inventory_delete)],
-
-            AD_AS_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assist_router)],
-            AD_AS_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assist_add)],
-            AD_AS_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assist_remove)],
-
-            AD_BROADCAST: [MessageHandler(filters.ALL & ~filters.COMMAND, admin_broadcast_receive)],
-            AD_RESTORE_WAIT: [MessageHandler(filters.ALL & ~filters.COMMAND, admin_restore_wait)],
-        },
-        fallbacks=[],
-        name="admin_conv",
-        persistent=False,
-        allow_reentry=True,
-    )
-    app.add_handler(admin_conv, group=0)
-
-    app.add_error_handler(on_error)
-
-    logger.info("✅ Bot started (polling). DATA_DIR=%s", cfg.DATA_DIR)
-    app.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+async def eshansy_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    
+    if text.startswith("📝 إنشاء / استلام حساب"):
+        return await eshansy_create_account(update, context)
+    elif text.startswith("💰 شحن حساب ايشانسي"):
+        return await eshansy_topup(update, context)
+    elif text.startswith("💸 سحب من حساب ايشانسي"):
+        return await eshansy_withdraw(update, context)
+    elif text.startswith("🗑️ حذف حساب ايشانسي"):
+        return await eshansy_delete(update, context)
+    elif text.startswith("🔙 رجوع"):
+        return await back_to_main(update, context)
+    else:
+        await update.message.reply_text(
+            "💼 اختر من قائمة ايشانسي:",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
 
 if __name__ == "__main__":
     main()
