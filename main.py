@@ -1,21 +1,21 @@
 import asyncio
 import os
 import sys
-
-# ==============================
-# FIX PYTHON PATH FOR RAILWAY
-# ==============================
+import importlib.util
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# إذا كان المشروع داخل مجلد (مثل Almokhtar/)
-PROJECT_DIR = os.path.join(BASE_DIR, "Almokhtar")
+# المسار الحقيقي لمجلد bot
+BOT_MAIN_PATH = os.path.join(BASE_DIR, "Almokhtar", "bot", "main.py")
 
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
+if not os.path.exists(BOT_MAIN_PATH):
+    raise RuntimeError(f"bot.main.py not found at: {BOT_MAIN_PATH}")
 
-# الآن الاستيراد سيعمل
-from bot.main import main
+# تحميل bot.main يدوياً
+spec = importlib.util.spec_from_file_location("bot.main", BOT_MAIN_PATH)
+bot_main = importlib.util.module_from_spec(spec)
+sys.modules["bot.main"] = bot_main
+spec.loader.exec_module(bot_main)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(bot_main.main())
