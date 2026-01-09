@@ -1,24 +1,20 @@
-"""Admin command (minimal gate)"""
+"""Admin handlers"""
 
 from telegram import Update
 from telegram.ext import ContextTypes
+import os
 
-from bot.database import get_db
-from bot.services.database import is_user_admin
-from bot.keyboards.admin import get_admin_menu
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
+
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_user = update.effective_user
-    db = await get_db()
-    async with db.get_session() as session:
-        ok = await is_user_admin(session, tg_user.id)
+    user = update.effective_user
 
-    if not ok:
-        await update.message.reply_text("❌ ليس لديك صلاحية الوصول.")
+    if user.id != SUPER_ADMIN_ID:
+        await update.message.reply_text("❌ هذا الأمر مخصص للإدارة فقط.")
         return
 
     await update.message.reply_text(
-        "👨‍💼 لوحة الإدارة
-اختر القسم المطلوب:",
-        reply_markup=get_admin_menu(tg_user.id, int(context.bot_data.get("super_admin_id", 0))),
+        "👨‍💼 لوحة الإدارة\n\n"
+        "اختر من القائمة أدناه:"
     )
