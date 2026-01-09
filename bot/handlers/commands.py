@@ -11,6 +11,7 @@ from bot.keyboards.main import get_main_menu
 
 logger = logging.getLogger(__name__)
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
 
@@ -26,22 +27,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_subscribed = await check_subscription(context, tg_user.id)
     if not is_subscribed:
+        required_channel = context.bot_data.get("required_channel") or "@broichancy"
+
         await update.message.reply_text(
-            "👋 مرحباً بك في بوت ايشانسي!
-
-"
-            "⚠️ يجب الاشتراك في القناة أولاً لاستخدام البوت:
-"
-            f"🔗 {context.bot_data.get('required_channel')}
-
-"
-            "بعد الاشتراك اضغط على زر التحقق",
+            "👋 مرحباً بك في بوت ايشانسي!\n\n"
+            "⚠️ يجب الاشتراك في القناة أولاً لاستخدام البوت:\n"
+            f"🔗 {required_channel}\n\n"
+            "بعد الاشتراك اضغط على زر التحقق.",
             reply_markup=get_subscription_keyboard(context),
         )
         return
 
     await update.message.reply_text(
-        "👋 أهلاً وسهلاً بك في بوت ايشانسي!
-اختر من القائمة أدناه:",
+        "👋 أهلاً وسهلاً بك في بوت ايشانسي!\n"
+        "اختر من القائمة أدناه:",
         reply_markup=get_main_menu(),
     )
