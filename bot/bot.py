@@ -36,17 +36,14 @@ class IchancyBot:
         """Blocking runner for Railway / local."""
 
         async def _post_init(app: Application):
-            # Put shared config in bot_data
             app.bot_data["required_channel"] = self.config.REQUIRED_CHANNEL
             app.bot_data["support_username"] = self.config.SUPPORT_USERNAME
             app.bot_data["min_topup"] = self.config.MIN_TOPUP
             app.bot_data["min_withdraw"] = self.config.MIN_WITHDRAW
             app.bot_data["super_admin_id"] = int(self.config.SUPER_ADMIN_ID)
 
-            # Init database
             await init_db(self.config)
 
-            # Ensure super admin exists
             async with (await get_db()).get_session() as session:
                 from bot.services.database import ensure_admin_user
                 await ensure_admin_user(session, int(self.config.SUPER_ADMIN_ID))
@@ -58,7 +55,6 @@ class IchancyBot:
             except Exception:
                 pass
 
-        # Build application
         self.application = (
             Application.builder()
             .token(self.config.BOT_TOKEN)
@@ -67,11 +63,9 @@ class IchancyBot:
             .build()
         )
 
-        # Register handlers
         self._register_handlers()
 
         logger.info("Bot is running (polling)...")
-        # ✅ الصحيح مع PTB v20+
         self.application.run_polling()
 
     def _register_handlers(self):
@@ -85,7 +79,17 @@ class IchancyBot:
             CommandHandler("admin", admin_handlers.admin_command)
         )
 
-        # Text messages (ReplyKeyboard)
+        # Text messages
         self.application.add_handler(
             MessageHandler(
-                filters
+                filters.TEXT & ~filters.COMMAND,
+                user_handlers.handle_message,
+            )
+        )
+
+        # Callback queries
+        self.application.add_handler(
+            CallbackQueryHandler(
+                utils_handlers.handle_callback_query
+            )
+        )
