@@ -858,7 +858,7 @@ async def safe_sleep_for_flood(e: Exception) -> None:
 
     AD_BROADCAST,
     AD_RESTORE_WAIT,
-) = range(28)
+) = range(29)
 
 # =========================
 # /start + subscription button
