@@ -1,31 +1,29 @@
-# Ichancy Telegram Bot
+# Almokhtar Telegram Bot — JSON Storage (بدون PostgreSQL)
 
-بوت تيليغرام لإدارة حسابات ايشانسي والمعاملات المالية.
+بوت منظم (مستخدم + أدمن) مع اشتراك إجباري بالقناة + Wallet (balance/hold) + نظام طلبات (pending/approved/rejected)
+وتخزين كامل داخل ملفات JSON ضمن مجلد data/ (أو DATA_DIR).
 
-## تشغيل سريع على Railway (مختصر)
+## المتطلبات
+- Python 3.10+ (يفضل 3.11)
+- حساب بوت من BotFather
 
-1) ارفع المشروع على GitHub
-2) Railway > New Project > Deploy from GitHub
-3) أضف PostgreSQL من Railway (Plugin) ثم انسخ `DATABASE_URL`
-4) Railway Variables: ضع القيم التالية:
-- `BOT_TOKEN`
-- `SUPER_ADMIN_ID`
-- `REQUIRED_CHANNEL`
-- `SUPPORT_USERNAME`
-- `DATABASE_URL`
-- (اختياري) `MIN_TOPUP`, `MIN_WITHDRAW`, `SYRIATEL_CODES`, `DEBUG`, `LOG_LEVEL`
-
-5) بعد أول تشغيل:
-- أنشئ الجداول عبر تشغيل `migrations/create_tables.sql` على قاعدة البيانات.
-
-> ملاحظة: هذا المشروع مُهيأ للتشغيل كبوت Polling (بدون Webhook) وهذا مناسب لـ Railway.
-
-## تشغيل محلياً
-
+## التثبيت محلياً
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-# عدّل .env
+```
+
+## إعداد ENV
+انسخ `.env.example` إلى `.env` وعدّل القيم.
+
+## التشغيل
+```bash
 python main.py
 ```
 
+## Railway (Polling)
+- ارفع المشروع إلى GitHub
+- اربطه في Railway
+- ضع المتغيرات في Variables
+- تشغيل Polling (بدون webhook)
