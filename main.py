@@ -2,11 +2,19 @@ import asyncio
 import os
 import sys
 
-# ✅ Ensure project root is on PYTHONPATH (important on Railway)
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# ==============================
+# FIX PYTHON PATH FOR RAILWAY
+# ==============================
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# إذا كان المشروع داخل مجلد (مثل Almokhtar/)
+PROJECT_DIR = os.path.join(BASE_DIR, "Almokhtar")
+
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+# الآن الاستيراد سيعمل
 from bot.main import main
 
 if __name__ == "__main__":
