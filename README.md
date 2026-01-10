@@ -1,20 +1,17 @@
-# Brobotbro — Single-file Telegram Bot (JSON Storage)
+# README.md
 
-## Files
-- main.py (كل البوت في ملف واحد)
-- requirements.txt
-- Procfile
-- railway.json
+# Telegram Bot - نظام محفظة وحسابات ايشانسي
 
-## ENV Variables (Railway Variables)
-BOT_TOKEN
-SUPER_ADMIN_ID
-REQUIRED_CHANNEL
-SUPPORT_USERNAME
-DATA_DIR (default: data)
-MIN_TOPUP (default: 15000)
-MIN_WITHDRAW (default: 50000)
-LOG_LEVEL (default: INFO)
+## 📋 نظرة عامة
+بوت تلغرام متكامل لإدارة المحافظ المالية وحسابات ايشانسي، مع نظام أدمن متطور.
 
-## Run
-python main.py
+## ⚙️ المتطلبات
+- Python 3.8+
+- Token بوت تلغرام
+- اشتراك في قناة تلغرام (للتحقق)
+
+## 🔧 التثبيت
+
+### 1. تثبيت المتطلبات
+```bash
+pip install -r requirements.txt
