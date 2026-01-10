@@ -1,4 +1,4 @@
-# main.py
+# main.py - النسخة المصححة
 import os
 import json
 import asyncio
@@ -9,7 +9,6 @@ import tempfile
 import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-from enum import Enum
 from pathlib import Path
 import aiofiles
 import aiofiles.os
@@ -20,9 +19,6 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    Message,
-    User,
-    Chat,
     InputFile
 )
 from telegram.ext import (
@@ -34,7 +30,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatMemberStatus
 
 # ==================== ENV VARIABLES ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -64,13 +60,7 @@ MAINTENANCE_FILE = Path(DATA_DIR) / "maintenance.json"
 BACKUP_DIR = Path(DATA_DIR) / "backups"
 
 # ==================== LOCK MANAGEMENT ====================
-file_locks = {
-    USERS_FILE: asyncio.Lock(),
-    ACCOUNTS_FILE: asyncio.Lock(),
-    PENDING_FILE: asyncio.Lock(),
-    ADMINS_FILE: asyncio.Lock(),
-    MAINTENANCE_FILE: asyncio.Lock()
-}
+file_locks = {}
 
 # ==================== DATA STRUCTURES ====================
 class UserData:
@@ -84,6 +74,8 @@ class UserData:
         self.is_admin = False
         self.is_super_admin = False
         self.created_at = datetime.now().isoformat()
+        self.username = None
+        self.first_name = None
         
     def to_dict(self):
         return {
@@ -95,7 +87,9 @@ class UserData:
             "subscribed": self.subscribed,
             "is_admin": self.is_admin,
             "is_super_admin": self.is_super_admin,
-            "created_at": self.created_at
+            "created_at": self.created_at,
+            "username": self.username,
+            "first_name": self.first_name
         }
     
     @classmethod
@@ -109,6 +103,8 @@ class UserData:
         user.is_admin = data.get("is_admin", False)
         user.is_super_admin = data.get("is_super_admin", False)
         user.created_at = data.get("created_at", datetime.now().isoformat())
+        user.username = data.get("username")
+        user.first_name = data.get("first_name")
         return user
 
 class EshansyAccount:
@@ -174,12 +170,14 @@ class PendingRequest:
         return req
 
 # ==================== STORAGE FUNCTIONS ====================
+def get_lock(file_path: Path):
+    if file_path not in file_locks:
+        file_locks[file_path] = asyncio.Lock()
+    return file_locks[file_path]
+
 async def atomic_write(file_path: Path, data: dict):
     """Atomic write with asyncio lock"""
-    lock = file_locks.get(file_path)
-    if not lock:
-        lock = asyncio.Lock()
-        file_locks[file_path] = lock
+    lock = get_lock(file_path)
     
     async with lock:
         # Write to temp file first
@@ -198,16 +196,16 @@ async def load_data(file_path: Path, default: Any = None):
     if not await aiofiles.os.path.exists(file_path):
         return default.copy() if isinstance(default, dict) else default
     
-    lock = file_locks.get(file_path)
-    if lock:
-        async with lock:
+    lock = get_lock(file_path)
+    async with lock:
+        try:
             async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
                 content = await f.read()
-                return json.loads(content) if content else default.copy()
-    else:
-        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-            content = await f.read()
-            return json.loads(content) if content else default.copy()
+                if not content.strip():
+                    return default.copy() if isinstance(default, dict) else default
+                return json.loads(content)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return default.copy() if isinstance(default, dict) else default
 
 async def save_data(file_path: Path, data: Any):
     """Save data atomically"""
@@ -276,7 +274,7 @@ def get_main_keyboard():
         ["💼 حساب ايشانسي", "💰 محفظتي"],
         ["➕ شحن رصيد البوت", "➖ سحب رصيد من البوت"],
         ["🧾 إلغاء آخر طلب سحب", "🆘 دعم"]
-    ], resize_keyboard=True, one_time_keyboard=False)
+    ], resize_keyboard=True)
 
 def get_eshansy_keyboard():
     return ReplyKeyboardMarkup([
@@ -290,6 +288,9 @@ def get_topup_methods_keyboard():
         [
             InlineKeyboardButton("💳 شام كاش", callback_data="topup_sham"),
             InlineKeyboardButton("📲 سيرياتيل كاش", callback_data="topup_syriatel")
+        ],
+        [
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
         ]
     ])
 
@@ -298,6 +299,9 @@ def get_withdraw_methods_keyboard():
         [
             InlineKeyboardButton("💳 شام كاش", callback_data="withdraw_sham"),
             InlineKeyboardButton("📲 سيرياتيل كاش", callback_data="withdraw_syriatel")
+        ],
+        [
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")
         ]
     ])
 
@@ -305,13 +309,14 @@ def get_syriatel_codes_keyboard():
     buttons = []
     for code in SYRIATEL_CODES:
         buttons.append([InlineKeyboardButton(f"📞 {code}", callback_data=f"code_{code}")])
-    buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_to_methods")])
     return InlineKeyboardMarkup(buttons)
 
 def get_subscription_keyboard():
+    channel_username = REQUIRED_CHANNEL.replace("@", "")
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ اشترك بالقناة", url=f"https://t.me/{REQUIRED_CHANNEL[1:]}")
+            InlineKeyboardButton("✅ اشترك بالقناة", url=f"https://t.me/{channel_username}")
         ],
         [
             InlineKeyboardButton("🔄 تحقق من الاشتراك", callback_data="check_subscription")
@@ -322,10 +327,10 @@ def get_admin_keyboard(is_super: bool = False):
     buttons = [
         ["📊 الإحصائيات", "👥 المستخدمين"],
         ["📨 الطلبات المعلقة", "⚙️ إعدادات"],
-        ["📢 رسالة جماعية"]
+        ["📢 رسالة جماعية", "🔙 رجوع للقائمة"]
     ]
     if is_super:
-        buttons.append(["💾 Backup/Restore", "🔧 الصيانة"])
+        buttons.insert(3, ["💾 Backup/Restore", "🔧 الصيانة"])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_pending_actions_keyboard(request_id: str):
@@ -335,7 +340,15 @@ def get_pending_actions_keyboard(request_id: str):
             InlineKeyboardButton("❌ رفض", callback_data=f"reject_{request_id}")
         ],
         [
-            InlineKeyboardButton("✏️ تعديل", callback_data=f"edit_{request_id}")
+            InlineKeyboardButton("🔙 رجوع", callback_data="back_to_pending")
+        ]
+    ])
+
+def get_confirmation_keyboard(yes_data: str, no_data: str):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ نعم", callback_data=yes_data),
+            InlineKeyboardButton("❌ لا", callback_data=no_data)
         ]
     ])
 
@@ -357,14 +370,11 @@ class States:
     WITHDRAW_CONFIRM = 23
     ADMIN_BROADCAST = 30
     ADMIN_BROADCAST_CONFIRM = 31
-    ADMIN_ADD_ACCOUNT = 40
-    ADMIN_DELETE_ACCOUNT = 41
-    ADMIN_MODIFY_BALANCE = 42
     ADMIN_SEARCH_USER = 43
 
 # ==================== UTILITY FUNCTIONS ====================
 def generate_request_id():
-    return datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
 
 async def check_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     try:
@@ -372,14 +382,21 @@ async def check_subscription(context: ContextTypes.DEFAULT_TYPE, user_id: int) -
         if user and user.subscribed:
             return True
             
+        # Check if user is subscribed to channel
         chat_member = await context.bot.get_chat_member(
             chat_id=REQUIRED_CHANNEL,
             user_id=user_id
         )
-        is_subscribed = chat_member.status in ["member", "administrator", "creator"]
+        
+        is_subscribed = chat_member.status in [
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR
+        ]
         
         if is_subscribed:
-            user = user or UserData(user_id)
+            if not user:
+                user = UserData(user_id)
             user.subscribed = True
             await DataManager.save_user(user)
         
@@ -392,20 +409,31 @@ async def require_subscription(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         
+        # Check maintenance mode
         if await DataManager.is_maintenance():
             if not await is_admin(user_id):
                 await update.message.reply_text(
                     "⚙️ البوت في وضع الصيانة. الرجاء المحاولة لاحقًا."
                 )
                 return
-                
+        
+        # Check subscription
         if not await check_subscription(context, user_id):
-            await update.message.reply_text(
-                f"👋 مرحباً {update.effective_user.first_name}!\n\n"
-                f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
-                "بعد الاشتراك اضغط على زر التحقق",
-                reply_markup=get_subscription_keyboard()
-            )
+            if update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(
+                    f"👋 مرحباً!\n\n"
+                    f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
+                    "بعد الاشتراك اضغط على زر التحقق",
+                    reply_markup=get_subscription_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    f"👋 مرحباً {update.effective_user.first_name}!\n\n"
+                    f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
+                    "بعد الاشتراك اضغط على زر التحقق",
+                    reply_markup=get_subscription_keyboard()
+                )
             return
         
         return await func(update, context)
@@ -443,23 +471,36 @@ async def send_to_admins(context: ContextTypes.DEFAULT_TYPE, message: str, parse
             except Exception as e:
                 logger.error(f"Failed to send to admin {user.user_id}: {e}")
 
-# ==================== HANDLERS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    # Initialize user if not exists
+async def initialize_user(user_id: int, username: str = None, first_name: str = None):
+    """Initialize or update user data"""
     user = await DataManager.get_user(user_id)
     if not user:
         user = UserData(user_id)
         if user_id == SUPER_ADMIN_ID:
             user.is_super_admin = True
             user.is_admin = True
-        await DataManager.save_user(user)
+    
+    if username:
+        user.username = username
+    if first_name:
+        user.first_name = first_name
+    
+    await DataManager.save_user(user)
+    return user
+
+# ==================== HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    
+    # Initialize user
+    await initialize_user(user_id, username, first_name)
     
     # Check subscription
     if await check_subscription(context, user_id):
         await update.message.reply_text(
-            f"👋 أهلاً وسهلاً {update.effective_user.first_name}!\n"
+            f"👋 أهلاً وسهلاً {first_name}!\n"
             "🚀 تم التحقق من اشتراكك بنجاح.\n\n"
             "⚡ اختر من القائمة:",
             reply_markup=get_main_keyboard()
@@ -467,7 +508,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return States.MAIN_MENU
     else:
         await update.message.reply_text(
-            f"👋 مرحباً {update.effective_user.first_name}!\n\n"
+            f"👋 مرحباً {first_name}!\n\n"
             f"📍 يجب الاشتراك في القناة أولاً:\n{REQUIRED_CHANNEL}\n\n"
             "بعد الاشتراك اضغط على زر التحقق",
             reply_markup=get_subscription_keyboard()
@@ -508,17 +549,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = update.message.text
     
-    if text.startswith("💼 حساب ايشانسي"):
+    if text == "💼 حساب ايشانسي":
         return await eshansy_menu(update, context)
-    elif text.startswith("💰 محفظتي"):
+    elif text == "💰 محفظتي":
         return await my_wallet(update, context)
-    elif text.startswith("➕ شحن رصيد البوت"):
+    elif text == "➕ شحن رصيد البوت":
         return await topup_menu(update, context)
-    elif text.startswith("➖ سحب رصيد من البوت"):
+    elif text == "➖ سحب رصيد من البوت":
         return await withdraw_menu(update, context)
-    elif text.startswith("🧾 إلغاء آخر طلب سحب"):
+    elif text == "🧾 إلغاء آخر طلب سحب":
         return await cancel_last_withdraw(update, context)
-    elif text.startswith("🆘 دعم"):
+    elif text == "🆘 دعم":
         return await support(update, context)
     elif text == "/admin":
         return await admin_panel(update, context)
@@ -536,8 +577,7 @@ async def my_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await DataManager.get_user(user_id)
     
     if not user:
-        user = UserData(user_id)
-        await DataManager.save_user(user)
+        user = await initialize_user(user_id)
     
     message = (
         f"💰 <b>محفظتك</b>\n\n"
@@ -571,6 +611,30 @@ async def eshansy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return States.ESHANSY_MENU
 
+async def eshansy_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    
+    if text == "📝 إنشاء / استلام حساب":
+        return await eshansy_create_account(update, context)
+    elif text == "💰 شحن حساب ايشانسي":
+        return await eshansy_topup(update, context)
+    elif text == "💸 سحب من حساب ايشانسي":
+        return await eshansy_withdraw(update, context)
+    elif text == "🗑️ حذف حساب ايشانسي":
+        return await eshansy_delete(update, context)
+    elif text == "🔙 رجوع":
+        await update.message.reply_text(
+            "⚡ القائمة الرئيسية:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
+    else:
+        await update.message.reply_text(
+            "💼 اختر من قائمة ايشانسي:",
+            reply_markup=get_eshansy_keyboard()
+        )
+        return States.ESHANSY_MENU
+
 @require_subscription
 async def eshansy_create_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -580,13 +644,17 @@ async def eshansy_create_account(update: Update, context: ContextTypes.DEFAULT_T
         accounts = await DataManager.get_accounts()
         account = accounts.get(user.eshansy_account)
         
-        message = (
-            f"📋 <b>حسابك الحالي</b>\n\n"
-            f"👤 اسم المستخدم: <code>{account.username}</code>\n"
-            f"🔑 كلمة المرور: <code>{account.password}</code>\n\n"
-            f"💰 رصيدك في ايشانسي: <code>{user.eshansy_balance}</code> نقطة\n\n"
-            "يمكنك نسخ المعلومات بالأعلى."
-        )
+        if account:
+            message = (
+                f"📋 <b>حسابك الحالي</b>\n\n"
+                f"👤 اسم المستخدم: <code>{account.username}</code>\n"
+                f"🔑 كلمة المرور: <code>{account.password}</code>\n\n"
+                f"💰 رصيدك في ايشانسي: <code>{user.eshansy_balance}</code> نقطة\n\n"
+                "يمكنك نسخ المعلومات بالأعلى."
+            )
+        else:
+            message = "❌ حسابك غير موجود في المخزون."
+        
         await update.message.reply_text(
             message,
             parse_mode=ParseMode.HTML,
@@ -635,12 +703,7 @@ async def eshansy_create_account_handler(update: Update, context: ContextTypes.D
             f"👤 <code>{best_match}</code>\n\n"
             "هل تريد تأكيد الاستلام؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy"),
-                    InlineKeyboardButton("❌ رفض", callback_data="reject_eshansy")
-                ]
-            ])
+            reply_markup=get_confirmation_keyboard("confirm_eshansy", "reject_eshansy")
         )
         return States.ESHANSY_CREATE
     else:
@@ -655,10 +718,17 @@ async def eshansy_confirm_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_eshansy":
         username = context.user_data.get("suggested_account")
         if not username:
             await query.edit_message_text("❌ حدث خطأ. الرجاء المحاولة مرة أخرى.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
         accounts = await DataManager.get_accounts()
@@ -666,10 +736,14 @@ async def eshansy_confirm_callback(update: Update, context: ContextTypes.DEFAULT
         
         if not account or account.assigned_to:
             await query.edit_message_text("❌ الحساب لم يعد متاحاً.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
         # Assign account
-        user_id = query.from_user.id
         account.assigned_to = user_id
         account.assigned_at = datetime.now().isoformat()
         
@@ -701,7 +775,7 @@ async def eshansy_confirm_callback(update: Update, context: ContextTypes.DEFAULT
     else:
         await query.edit_message_text("❌ تم إلغاء العملية.")
         await context.bot.send_message(
-            chat_id=query.from_user.id,
+            chat_id=user_id,
             text="💼 اختر من قائمة ايشانسي:",
             reply_markup=get_eshansy_keyboard()
         )
@@ -732,7 +806,11 @@ async def eshansy_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def eshansy_topup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(update.message.text.strip())
+        amount_text = update.message.text.strip()
+        if not amount_text.replace('.', '', 1).isdigit():
+            raise ValueError
+        
+        amount = float(amount_text)
         if amount <= 0:
             raise ValueError
         
@@ -762,12 +840,7 @@ async def eshansy_topup_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"💳 سيتم خصم: <code>{amount:,.0f}</code> ليرة من رصيدك\n\n"
             "هل تريد المتابعة؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy_topup"),
-                    InlineKeyboardButton("❌ إلغاء", callback_data="cancel_eshansy_topup")
-                ]
-            ])
+            reply_markup=get_confirmation_keyboard("confirm_eshansy_topup", "cancel_eshansy_topup")
         )
         return States.ESHANSY_TOPUP
     except ValueError:
@@ -782,52 +855,35 @@ async def eshansy_topup_confirm_callback(update: Update, context: ContextTypes.D
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_eshansy_topup":
         data = context.user_data.get("eshansy_topup")
         if not data:
             await query.edit_message_text("❌ انتهت صلاحية البيانات.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
-        user_id = query.from_user.id
         user = await DataManager.get_user(user_id)
         
         if user.balance < data["amount_sy"]:
             await query.edit_message_text("❌ رصيدك غير كافي.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
-        # Deduct from user balance
+        # Deduct from user balance and add to eshansy balance
         user.balance -= data["amount_sy"]
         user.eshansy_balance += data["eshansy_points"]
         
-        # Create pending request for admin notification
-        request_id = generate_request_id()
-        pending_request = PendingRequest(
-            request_id=request_id,
-            user_id=user_id,
-            req_type="eshansy_topup",
-            data={
-                "amount_sy": data["amount_sy"],
-                "eshansy_points": data["eshansy_points"],
-                "username": user.eshansy_account
-            }
-        )
-        
-        pending = await DataManager.get_pending_requests()
-        pending[request_id] = pending_request
-        await DataManager.save_pending_requests(pending)
-        
         await DataManager.save_user(user)
-        
-        # Notify admins
-        admin_message = (
-            f"🔄 <b>طلب شحن ايشانسي جديد</b>\n\n"
-            f"🆔 رقم الطلب: <code>{request_id}</code>\n"
-            f"👤 المستخدم: {user_id}\n"
-            f"👤 حساب ايشانسي: {user.eshansy_account}\n"
-            f"💰 المبلغ: {data['amount_sy']:,.0f} ليرة\n"
-            f"🎯 النقاط: {data['eshansy_points']:,} نقطة"
-        )
-        await send_to_admins(context, admin_message)
         
         await query.edit_message_text(
             f"✅ <b>تم شحن حسابك بنجاح!</b>\n\n"
@@ -840,7 +896,7 @@ async def eshansy_topup_confirm_callback(update: Update, context: ContextTypes.D
         await query.edit_message_text("❌ تم إلغاء العملية.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="💼 اختر من قائمة ايشانسي:",
         reply_markup=get_eshansy_keyboard()
     )
@@ -870,7 +926,11 @@ async def eshansy_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def eshansy_withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        points = int(update.message.text.strip())
+        points_text = update.message.text.strip()
+        if not points_text.isdigit():
+            raise ValueError
+        
+        points = int(points_text)
         if points <= 0:
             raise ValueError
         
@@ -900,12 +960,7 @@ async def eshansy_withdraw_handler(update: Update, context: ContextTypes.DEFAULT
             f"💰 سيتم إضافة: <code>{amount_sy:,.0f}</code> ليرة إلى رصيدك\n\n"
             "هل تريد المتابعة؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ تأكيد", callback_data="confirm_eshansy_withdraw"),
-                    InlineKeyboardButton("❌ إلغاء", callback_data="cancel_eshansy_withdraw")
-                ]
-            ])
+            reply_markup=get_confirmation_keyboard("confirm_eshansy_withdraw", "cancel_eshansy_withdraw")
         )
         return States.ESHANSY_WITHDRAW
     except ValueError:
@@ -920,17 +975,28 @@ async def eshansy_withdraw_confirm_callback(update: Update, context: ContextType
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_eshansy_withdraw":
         data = context.user_data.get("eshansy_withdraw")
         if not data:
             await query.edit_message_text("❌ انتهت صلاحية البيانات.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
-        user_id = query.from_user.id
         user = await DataManager.get_user(user_id)
         
         if user.eshansy_balance < data["points"]:
             await query.edit_message_text("❌ رصيدك غير كافي.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="💼 اختر من قائمة ايشانسي:",
+                reply_markup=get_eshansy_keyboard()
+            )
             return States.ESHANSY_MENU
         
         # Create pending request
@@ -972,7 +1038,7 @@ async def eshansy_withdraw_confirm_callback(update: Update, context: ContextType
         await query.edit_message_text("❌ تم إلغاء العملية.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="💼 اختر من قائمة ايشانسي:",
         reply_markup=get_eshansy_keyboard()
     )
@@ -1006,12 +1072,7 @@ async def eshansy_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "يمكنك استلام حساب جديد لاحقاً.</i>\n\n"
         "هل أنت متأكد من حذف الحساب؟",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ نعم، احذف", callback_data="confirm_delete_eshansy"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="cancel_delete_eshansy")
-            ]
-        ])
+        reply_markup=get_confirmation_keyboard("confirm_delete_eshansy", "cancel_delete_eshansy")
     )
     return States.ESHANSY_MENU
 
@@ -1019,8 +1080,9 @@ async def eshansy_delete_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_delete_eshansy":
-        user_id = query.from_user.id
         user = await DataManager.get_user(user_id)
         
         if user.eshansy_account:
@@ -1049,18 +1111,11 @@ async def eshansy_delete_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ تم إلغاء العملية.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="💼 اختر من قائمة ايشانسي:",
         reply_markup=get_eshansy_keyboard()
     )
     return States.ESHANSY_MENU
-
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚡ القائمة الرئيسية:",
-        reply_markup=get_main_keyboard()
-    )
-    return States.MAIN_MENU
 
 # ==================== TOPUP FUNCTIONS ====================
 @require_subscription
@@ -1109,7 +1164,7 @@ async def topup_method_callback(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.HTML
         )
         return States.TOPUP_SYRIA_REF
-    elif query.data == "back":
+    elif query.data == "back_to_methods":
         await query.edit_message_text(
             "➕ <b>شحن رصيد البوت</b>\n\n"
             "اختر طريقة الشحن:",
@@ -1117,6 +1172,14 @@ async def topup_method_callback(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=get_topup_methods_keyboard()
         )
         return States.TOPUP_METHOD
+    elif query.data == "back_to_main":
+        await query.edit_message_text("إلغاء العملية.")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
 
 async def topup_ref_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ref_number = update.message.text.strip()
@@ -1140,7 +1203,11 @@ async def topup_ref_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def topup_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(update.message.text.strip())
+        amount_text = update.message.text.strip()
+        if not amount_text.replace('.', '', 1).isdigit():
+            raise ValueError
+        
+        amount = float(amount_text)
         
         if amount < MIN_TOPUP:
             await update.message.reply_text(
@@ -1159,12 +1226,7 @@ async def topup_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             f"💰 المبلغ: <code>{amount:,.0f}</code> ليرة\n\n"
             "هل البيانات صحيحة؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ نعم، تأكيد", callback_data="confirm_topup"),
-                    InlineKeyboardButton("❌ لا، إعادة", callback_data="cancel_topup")
-                ]
-            ])
+            reply_markup=get_confirmation_keyboard("confirm_topup", "cancel_topup")
         )
         return States.TOPUP_CONFIRM
     except ValueError:
@@ -1178,9 +1240,9 @@ async def topup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_topup":
-        user_id = query.from_user.id
-        
         # Create pending request
         request_id = generate_request_id()
         pending_request = PendingRequest(
@@ -1225,7 +1287,7 @@ async def topup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ تم إلغاء الطلب.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="⚡ اختر من القائمة:",
         reply_markup=get_main_keyboard()
     )
@@ -1266,11 +1328,20 @@ async def withdraw_method_callback(update: Update, context: ContextTypes.DEFAULT
             "أدخل رقم سيرياتيل المستلم:"
         )
         return States.WITHDRAW_SYRIA_NUMBER
+    elif query.data == "back_to_main":
+        await query.edit_message_text("إلغاء العملية.")
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚡ اختر من القائمة:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
 
 async def withdraw_number_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone_number = update.message.text.strip()
     
-    if not phone_number.isdigit() or len(phone_number) < 10:
+    # Simple validation for Syrian phone numbers
+    if not phone_number.isdigit() or len(phone_number) < 9 or len(phone_number) > 12:
         await update.message.reply_text(
             "❌ رقم الهاتف غير صحيح.\n"
             "الرجاء إدخال رقم سيرياتيل صحيح:\n"
@@ -1290,7 +1361,11 @@ async def withdraw_number_handler(update: Update, context: ContextTypes.DEFAULT_
 
 async def withdraw_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(update.message.text.strip())
+        amount_text = update.message.text.strip()
+        if not amount_text.replace('.', '', 1).isdigit():
+            raise ValueError
+        
+        amount = float(amount_text)
         user_id = update.effective_user.id
         user = await DataManager.get_user(user_id)
         
@@ -1322,12 +1397,7 @@ async def withdraw_amount_handler(update: Update, context: ContextTypes.DEFAULT_
             f"💳 سيتم خصم: <code>{amount:,.0f}</code> ليرة من رصيدك\n\n"
             "هل تريد المتابعة؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ نعم، تأكيد", callback_data="confirm_withdraw"),
-                    InlineKeyboardButton("❌ لا، إلغاء", callback_data="cancel_withdraw")
-                ]
-            ])
+            reply_markup=get_confirmation_keyboard("confirm_withdraw", "cancel_withdraw")
         )
         return States.WITHDRAW_CONFIRM
     except ValueError:
@@ -1341,8 +1411,9 @@ async def withdraw_confirm_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "confirm_withdraw":
-        user_id = query.from_user.id
         user = await DataManager.get_user(user_id)
         amount = context.user_data.get("withdraw_amount")
         
@@ -1408,7 +1479,7 @@ async def withdraw_confirm_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("❌ تم إلغاء الطلب.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="⚡ اختر من القائمة:",
         reply_markup=get_main_keyboard()
     )
@@ -1436,17 +1507,6 @@ async def cancel_last_withdraw(update: Update, context: ContextTypes.DEFAULT_TYP
     user_pending.sort(reverse=True)
     latest_req = user_pending[0][2]
     
-    # Check if it's within reasonable time (e.g., last 24 hours)
-    req_time = datetime.fromisoformat(latest_req.created_at)
-    time_diff = datetime.now() - req_time
-    
-    if time_diff.total_seconds() > 24 * 3600:  # 24 hours
-        await update.message.reply_text(
-            "❌ لا يمكن إلغاء الطلب بعد مرور 24 ساعة.",
-            reply_markup=get_main_keyboard()
-        )
-        return States.MAIN_MENU
-    
     await update.message.reply_text(
         f"🧾 <b>إلغاء آخر طلب سحب</b>\n\n"
         f"🆔 رقم الطلب: <code>{latest_req.request_id}</code>\n"
@@ -1454,18 +1514,15 @@ async def cancel_last_withdraw(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📞 إلى رقم: <code>{latest_req.data.get('phone', '')}</code>\n\n"
         "هل تريد إلغاء هذا الطلب؟",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ نعم، ألغي", callback_data=f"cancel_req_{latest_req.request_id}"),
-                InlineKeyboardButton("❌ لا، احتفظ", callback_data="keep_request")
-            ]
-        ])
+        reply_markup=get_confirmation_keyboard(f"cancel_req_{latest_req.request_id}", "keep_request")
     )
     return States.MAIN_MENU
 
 async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    user_id = query.from_user.id
     
     if query.data.startswith("cancel_req_"):
         request_id = query.data[11:]
@@ -1475,6 +1532,11 @@ async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT
         
         if not request or request.status != "pending" or request.type != "withdraw":
             await query.edit_message_text("❌ الطلب غير موجود أو تم معالجته بالفعل.")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="⚡ اختر من القائمة:",
+                reply_markup=get_main_keyboard()
+            )
             return
         
         # Return held amount to user
@@ -1484,7 +1546,7 @@ async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT
         
         # Mark as cancelled
         request.status = "cancelled"
-        request.handled_by = query.from_user.id
+        request.handled_by = user_id
         request.handled_at = datetime.now().isoformat()
         
         await DataManager.save_user(user)
@@ -1495,7 +1557,7 @@ async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT
             f"❌ <b>تم إلغاء طلب سحب</b>\n\n"
             f"🆔 رقم الطلب: <code>{request_id}</code>\n"
             f"👤 المستخدم: {request.user_id}\n"
-            f"👤 الملغي بواسطة: {query.from_user.id}\n"
+            f"👤 الملغي بواسطة: المستخدم نفسه\n"
             f"💰 المبلغ: {request.data.get('amount', 0):,.0f} ليرة\n\n"
             f"💵 <i>تم إرجاع المبلغ المحجوز إلى رصيد المستخدم</i>"
         )
@@ -1511,7 +1573,7 @@ async def cancel_withdraw_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("❌ تم الإبقاء على الطلب.")
     
     await context.bot.send_message(
-        chat_id=query.from_user.id,
+        chat_id=user_id,
         text="⚡ اختر من القائمة:",
         reply_markup=get_main_keyboard()
     )
@@ -1582,20 +1644,27 @@ async def admin_handle_message(update: Update, context: ContextTypes.DEFAULT_TYP
     
     text = update.message.text
     
-    if text.startswith("📊 الإحصائيات"):
+    if text == "📊 الإحصائيات":
         return await admin_panel(update, context)
-    elif text.startswith("👥 المستخدمين"):
+    elif text == "👥 المستخدمين":
         return await admin_search_user(update, context)
-    elif text.startswith("📨 الطلبات المعلقة"):
+    elif text == "📨 الطلبات المعلقة":
         return await admin_pending_requests(update, context)
-    elif text.startswith("⚙️ إعدادات"):
+    elif text == "⚙️ إعدادات":
         return await admin_settings(update, context)
-    elif text.startswith("📢 رسالة جماعية"):
+    elif text == "📢 رسالة جماعية":
         return await admin_broadcast_start(update, context)
-    elif text.startswith("💾 Backup/Restore"):
+    elif text == "💾 Backup/Restore":
         return await admin_backup_restore(update, context)
-    elif text.startswith("🔧 الصيانة"):
+    elif text == "🔧 الصيانة":
         return await admin_maintenance(update, context)
+    elif text == "🔙 رجوع للقائمة":
+        context.user_data.pop("admin_mode", None)
+        await update.message.reply_text(
+            "⚡ القائمة الرئيسية:",
+            reply_markup=get_main_keyboard()
+        )
+        return States.MAIN_MENU
     else:
         await update.message.reply_text(
             "⚙️ اختر من قائمة الأدمن:",
@@ -1604,13 +1673,14 @@ async def admin_handle_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return States.MAIN_MENU
 
 async def admin_pending_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     pending = await DataManager.get_pending_requests()
     pending_list = [r for r in pending.values() if r.status == "pending"]
     
     if not pending_list:
         await update.message.reply_text(
             "✅ لا توجد طلبات معلقة حالياً.",
-            reply_markup=get_admin_keyboard(await is_super_admin(update.effective_user.id))
+            reply_markup=get_admin_keyboard(await is_super_admin(user_id))
         )
         return States.MAIN_MENU
     
@@ -1623,27 +1693,22 @@ async def admin_pending_requests(update: Update, context: ContextTypes.DEFAULT_T
     
     message = "📨 <b>الطلبات المعلقة</b>\n\n"
     
+    type_names = {
+        "topup": "💳 شحن رصيد",
+        "withdraw": "💸 سحب رصيد",
+        "eshansy_topup": "💰 شحن ايشانسي",
+        "eshansy_withdraw": "💼 سحب ايشانسي"
+    }
+    
     for req_type, reqs in requests_by_type.items():
-        type_name = {
-            "topup": "شحن رصيد",
-            "withdraw": "سحب رصيد",
-            "eshansy_topup": "شحن ايشانسي",
-            "eshansy_withdraw": "سحب ايشانسي"
-        }.get(req_type, req_type)
-        
+        type_name = type_names.get(req_type, req_type)
         message += f"📌 <b>{type_name}:</b> {len(reqs)} طلب\n"
     
     message += "\nاختر نوع الطلبات لعرضها:"
     
     keyboard = []
     for req_type in requests_by_type.keys():
-        type_name = {
-            "topup": "💳 شحن رصيد",
-            "withdraw": "💸 سحب رصيد",
-            "eshansy_topup": "💰 شحن ايشانسي",
-            "eshansy_withdraw": "💼 سحب ايشانسي"
-        }.get(req_type, req_type)
-        
+        type_name = type_names.get(req_type, req_type)
         keyboard.append([InlineKeyboardButton(type_name, callback_data=f"admin_show_{req_type}")])
     
     keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
@@ -1659,10 +1724,12 @@ async def admin_show_requests_callback(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    
     if query.data == "admin_back":
         await query.edit_message_text(
             "⚙️ اختر من قائمة الأدمن:",
-            reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
+            reply_markup=get_admin_keyboard(await is_super_admin(user_id))
         )
         return
     
@@ -1675,7 +1742,7 @@ async def admin_show_requests_callback(update: Update, context: ContextTypes.DEF
         await query.edit_message_text(
             f"✅ لا توجد طلبات من نوع {req_type}.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_requests")]
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_pending")]
             ])
         )
         return
@@ -1690,17 +1757,21 @@ async def admin_show_requests_callback(update: Update, context: ContextTypes.DEF
 async def show_request_detail(query, context, req):
     user = await DataManager.get_user(req.user_id)
     
-    type_name = {
+    type_names = {
         "topup": "💳 طلب شحن رصيد",
         "withdraw": "💸 طلب سحب رصيد",
         "eshansy_topup": "💰 طلب شحن ايشانسي",
         "eshansy_withdraw": "💼 طلب سحب ايشانسي"
-    }.get(req.type, req.type)
+    }
     
-    message = f"{type_name}\n\n"
+    message = f"{type_names.get(req.type, req.type)}\n\n"
     message += f"🆔 رقم الطلب: <code>{req.request_id}</code>\n"
     message += f"👤 المستخدم: <code>{req.user_id}</code>\n"
-    message += f"📅 التاريخ: {req.created_at}\n\n"
+    
+    if user and user.username:
+        message += f"👤 اليوزر: @{user.username}\n"
+    
+    message += f"📅 التاريخ: {req.created_at[:19].replace('T', ' ')}\n\n"
     
     if req.type == "topup":
         message += (
@@ -1729,9 +1800,10 @@ async def show_request_detail(query, context, req):
             f"💰 المبلغ: <code>{req.data.get('amount_sy', 0):,.0f}</code> ليرة\n"
         )
     
-    message += f"\n💵 رصيد المستخدم: <code>{user.balance:,.0f}</code> ليرة"
-    if user.eshansy_account:
-        message += f"\n💼 رصيد ايشانسي: <code>{user.eshansy_balance:,}</code> نقطة"
+    if user:
+        message += f"\n💵 رصيد المستخدم: <code>{user.balance:,.0f}</code> ليرة"
+        if user.eshansy_account:
+            message += f"\n💼 رصيد ايشانسي: <code>{user.eshansy_balance:,}</code> نقطة"
     
     keyboard = get_pending_actions_keyboard(req.request_id)
     
@@ -1743,11 +1815,12 @@ async def show_request_detail(query, context, req):
         nav_buttons = []
         if current_index > 0:
             nav_buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"admin_nav_{current_index-1}"))
+        nav_buttons.append(InlineKeyboardButton(f"{current_index+1}/{len(requests_list)}", callback_data="noop"))
         if current_index < len(requests_list) - 1:
             nav_buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"admin_nav_{current_index+1}"))
         
         if nav_buttons:
-            keyboard.inline_keyboard.append(nav_buttons)
+            keyboard.inline_keyboard.insert(0, nav_buttons)
     
     await query.edit_message_text(
         message,
@@ -1758,6 +1831,28 @@ async def show_request_detail(query, context, req):
 async def admin_request_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    if query.data == "noop":
+        return
+    
+    if query.data == "back_to_pending":
+        await query.edit_message_text(
+            "📨 <b>الطلبات المعلقة</b>\n\n"
+            "اختر نوع الطلبات:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("💳 شحن رصيد", callback_data="admin_show_topup"),
+                    InlineKeyboardButton("💸 سحب رصيد", callback_data="admin_show_withdraw")
+                ],
+                [
+                    InlineKeyboardButton("💰 شحن ايشانسي", callback_data="admin_show_eshansy_topup"),
+                    InlineKeyboardButton("💼 سحب ايشانسي", callback_data="admin_show_eshansy_withdraw")
+                ],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+            ])
+        )
+        return
     
     if query.data.startswith("admin_nav_"):
         index = int(query.data[10:])
@@ -1777,9 +1872,6 @@ async def admin_request_action_callback(update: Update, context: ContextTypes.DE
     elif query.data.startswith("reject_"):
         request_id = query.data[7:]
         await handle_reject_request(query, context, request_id)
-    elif query.data.startswith("edit_"):
-        request_id = query.data[5:]
-        await handle_edit_request(query, context, request_id)
 
 async def handle_approve_request(query, context, request_id):
     pending = await DataManager.get_pending_requests()
@@ -1790,6 +1882,7 @@ async def handle_approve_request(query, context, request_id):
         return
     
     user = await DataManager.get_user(request.user_id)
+    admin_id = query.from_user.id
     
     if request.type == "topup":
         # Add balance to user
@@ -1811,13 +1904,23 @@ async def handle_approve_request(query, context, request_id):
             logger.error(f"Failed to notify user: {e}")
     
     elif request.type == "withdraw":
-        # Keep hold amount as is (already held during request)
-        # Just mark as approved
-        pass
-    
-    elif request.type == "eshansy_topup":
-        # Already processed during request creation
-        pass
+        # Release hold (amount already deducted during request creation)
+        user.hold -= request.data.get("amount", 0)
+        await DataManager.save_user(user)
+        
+        try:
+            await context.bot.send_message(
+                chat_id=request.user_id,
+                text=f"✅ <b>تمت الموافقة على طلب السحب!</b>\n\n"
+                     f"🆔 رقم الطلب: <code>{request_id}</code>\n"
+                     f"💰 المبلغ: <code>{request.data.get('amount', 0):,.0f}</code> ليرة\n"
+                     f"📞 إلى رقم: <code>{request.data.get('phone')}</code>\n\n"
+                     f"💵 تم تحويل المبلغ إلى حسابك.\n"
+                     f"💰 رصيدك الحالي: <code>{user.balance:,.0f}</code> ليرة",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
     
     elif request.type == "eshansy_withdraw":
         # Deduct from eshansy balance and add to user balance
@@ -1841,21 +1944,21 @@ async def handle_approve_request(query, context, request_id):
     
     # Update request status
     request.status = "approved"
-    request.handled_by = query.from_user.id
+    request.handled_by = admin_id
     request.handled_at = datetime.now().isoformat()
     
     await DataManager.save_pending_requests(pending)
     
-    # Remove from current view
+    # Show next request or go back
     requests_list = context.user_data.get("current_requests", [])
     if request_id in requests_list:
         requests_list.remove(request_id)
-        context.user_data["current_requests"] = requests_list
     
-    # Show next request or go back
     if requests_list:
         next_index = min(context.user_data.get("current_request_index", 0), len(requests_list)-1)
         context.user_data["current_request_index"] = next_index
+        context.user_data["current_requests"] = requests_list
+        
         next_request_id = requests_list[next_index]
         next_req = pending.get(next_request_id)
         
@@ -1883,6 +1986,7 @@ async def handle_reject_request(query, context, request_id):
         return
     
     user = await DataManager.get_user(request.user_id)
+    admin_id = query.from_user.id
     
     if request.type == "withdraw":
         # Return held amount to available balance
@@ -1920,21 +2024,21 @@ async def handle_reject_request(query, context, request_id):
     
     # Update request status
     request.status = "rejected"
-    request.handled_by = query.from_user.id
+    request.handled_by = admin_id
     request.handled_at = datetime.now().isoformat()
     
     await DataManager.save_pending_requests(pending)
     
-    # Remove from current view
+    # Show next request or go back
     requests_list = context.user_data.get("current_requests", [])
     if request_id in requests_list:
         requests_list.remove(request_id)
-        context.user_data["current_requests"] = requests_list
     
-    # Show next request or go back
     if requests_list:
         next_index = min(context.user_data.get("current_request_index", 0), len(requests_list)-1)
         context.user_data["current_request_index"] = next_index
+        context.user_data["current_requests"] = requests_list
+        
         next_request_id = requests_list[next_index]
         next_req = pending.get(next_request_id)
         
@@ -1953,9 +2057,6 @@ async def handle_reject_request(query, context, request_id):
             reply_markup=get_admin_keyboard(await is_super_admin(query.from_user.id))
         )
 
-async def handle_edit_request(query, context, request_id):
-    await query.answer("⚠️ هذه الميزة قيد التطوير", show_alert=True)
-
 async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_super = await is_super_admin(user_id)
@@ -1963,27 +2064,36 @@ async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "⚙️ <b>إعدادات الأدمن</b>\n\n"
     
     if is_super:
-        message += "👑 <b>أنت أدمن رئيسي</b>\n\n"
-        message += "🔧 <b>الخيارات المتاحة:</b>\n"
-        message += "1️⃣ تعديل رصيد مستخدم\n"
-        message += "2️⃣ إضافة حساب ايشانسي\n"
-        message += "3️⃣ حذف حساب ايشانسي\n"
-        message += "4️⃣ تعيين أدمن مساعد\n"
-        message += "5️⃣ إزالة أدمن مساعد\n"
+        admins = await DataManager.get_admins()
+        message += f"👑 <b>أنت أدمن رئيسي</b>\n\n"
+        message += f"👥 <b>الأدمن المساعدون:</b> {len(admins)}\n"
+        for admin_id in admins:
+            admin_user = await DataManager.get_user(admin_id)
+            if admin_user and admin_user.username:
+                message += f"• @{admin_user.username}\n"
+            else:
+                message += f"• {admin_id}\n"
+        
+        message += "\n🔧 <b>الخيارات المتاحة:</b>\n"
+        message += "• إضافة حساب ايشانسي جديد\n"
+        message += "• تعيين أدمن مساعد\n"
+        message += "• إزالة أدمن مساعد\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("➕ إضافة حساب ايشانسي", callback_data="admin_add_account")],
+            [InlineKeyboardButton("👤 تعيين أدمن مساعد", callback_data="admin_add_assistant")],
+            [InlineKeyboardButton("🗑️ إزالة أدمن مساعد", callback_data="admin_remove_assistant")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+        ]
     else:
         message += "👨‍💼 <b>أنت أدمن مساعد</b>\n\n"
-        message += "🔧 <b>الخيارات المتاحة:</b>\n"
-        message += "1️⃣ عرض طلبات المستخدمين\n"
-        message += "2️⃣ قبول/رفض الطلبات\n"
-    
-    keyboard = []
-    if is_super:
-        keyboard.append([InlineKeyboardButton("➕ إضافة حساب ايشانسي", callback_data="admin_add_account")])
-        keyboard.append([InlineKeyboardButton("➖ حذف حساب ايشانسي", callback_data="admin_delete_account")])
-        keyboard.append([InlineKeyboardButton("💰 تعديل رصيد مستخدم", callback_data="admin_modify_balance")])
-        keyboard.append([InlineKeyboardButton("👤 تعيين أدمن مساعد", callback_data="admin_add_assistant")])
-    
-    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+        message += "🔧 <b>الصلاحيات:</b>\n"
+        message += "• عرض طلبات المستخدمين\n"
+        message += "• قبول/رفض الطلبات\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+        ]
     
     await update.message.reply_text(
         message,
@@ -2281,7 +2391,16 @@ async def show_user_detail(update, context, user):
     message = (
         f"👤 <b>معلومات المستخدم</b>\n\n"
         f"🆔 الرقم: <code>{user.user_id}</code>\n"
-        f"📅 تاريخ الإنشاء: {user.created_at}\n"
+    )
+    
+    if user.username:
+        message += f"👤 اليوزر: @{user.username}\n"
+    
+    if user.first_name:
+        message += f"👤 الاسم: {user.first_name}\n"
+    
+    message += (
+        f"📅 تاريخ الإنشاء: {user.created_at[:19].replace('T', ' ')}\n"
         f"✅ مشترك في القناة: {'نعم' if user.subscribed else 'لا'}\n"
         f"👑 أدمن: {'نعم' if user.is_admin else 'لا'}\n"
         f"👑 أدمن رئيسي: {'نعم' if user.is_super_admin else 'لا'}\n\n"
@@ -2391,17 +2510,13 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["broadcast_message"] = update.message
     
     # Ask for confirmation
+    users_count = len(await DataManager.get_all_users())
     await update.message.reply_text(
-        "✅ <b>تم استلام الرسالة</b>\n\n"
-        "هل تريد إرسالها لجميع المستخدمين؟\n\n"
-        f"👥 عدد المستخدمين: {len(await DataManager.get_all_users())}",
+        f"✅ <b>تم استلام الرسالة</b>\n\n"
+        f"هل تريد إرسالها لجميع المستخدمين؟\n\n"
+        f"👥 عدد المستخدمين: {users_count}",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ نعم، أرسل", callback_data="confirm_broadcast"),
-                InlineKeyboardButton("❌ لا، ألغي", callback_data="cancel_broadcast")
-            ]
-        ])
+        reply_markup=get_confirmation_keyboard("confirm_broadcast", "cancel_broadcast")
     )
     
     return States.ADMIN_BROADCAST_CONFIRM
@@ -2435,21 +2550,21 @@ async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAU
                 await context.bot.send_message(
                     chat_id=user_id,
                     text=broadcast_msg.text,
-                    parse_mode=ParseMode.HTML if broadcast_msg.parse_mode else None
+                    parse_mode=ParseMode.HTML
                 )
             elif broadcast_msg.photo:
                 await context.bot.send_photo(
                     chat_id=user_id,
                     photo=broadcast_msg.photo[-1].file_id,
                     caption=broadcast_msg.caption,
-                    parse_mode=ParseMode.HTML if broadcast_msg.caption_entities else None
+                    parse_mode=ParseMode.HTML if broadcast_msg.caption else None
                 )
             elif broadcast_msg.video:
                 await context.bot.send_video(
                     chat_id=user_id,
                     video=broadcast_msg.video.file_id,
                     caption=broadcast_msg.caption,
-                    parse_mode=ParseMode.HTML if broadcast_msg.caption_entities else None
+                    parse_mode=ParseMode.HTML if broadcast_msg.caption else None
                 )
             
             success += 1
@@ -2495,14 +2610,135 @@ async def admin_back_requests_callback(update: Update, context: ContextTypes.DEF
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception occurred:", exc_info=context.error)
     
-    if update and update.effective_user:
+    try:
+        # Notify super admin about error
+        if SUPER_ADMIN_ID:
+            await context.bot.send_message(
+                chat_id=SUPER_ADMIN_ID,
+                text=f"❌ حدث خطأ في البوت:\n\n{context.error}"
+            )
+    except:
+        pass
+
+# ==================== COMMAND HANDLERS ====================
+async def add_account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add eshansy account via command /addaccount username password"""
+    user_id = update.effective_user.id
+    
+    if not await is_super_admin(user_id):
+        await update.message.reply_text("❌ هذا الأمر للأدمن الرئيسي فقط.")
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ استخدام خاطئ.\n"
+            "استخدم: /addaccount username password\n"
+            "مثال: /addaccount user123 pass123"
+        )
+        return
+    
+    username = context.args[0].strip().lower()
+    password = context.args[1].strip()
+    
+    accounts = await DataManager.get_accounts()
+    
+    if username in accounts:
+        await update.message.reply_text(f"❌ الحساب {username} موجود بالفعل.")
+        return
+    
+    accounts[username] = EshansyAccount(username, password)
+    await DataManager.save_accounts(accounts)
+    
+    await update.message.reply_text(f"✅ تم إضافة حساب {username} بنجاح.")
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add admin via command /addadmin user_id"""
+    user_id = update.effective_user.id
+    
+    if not await is_super_admin(user_id):
+        await update.message.reply_text("❌ هذا الأمر للأدمن الرئيسي فقط.")
+        return
+    
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text(
+            "❌ استخدام خاطئ.\n"
+            "استخدم: /addadmin user_id\n"
+            "مثال: /addadmin 123456789"
+        )
+        return
+    
+    try:
+        new_admin_id = int(context.args[0].strip())
+        
+        # Initialize user if not exists
+        new_user = await DataManager.get_user(new_admin_id)
+        if not new_user:
+            new_user = UserData(new_admin_id)
+            await DataManager.save_user(new_user)
+        
+        admins = await DataManager.get_admins()
+        if new_admin_id in admins:
+            await update.message.reply_text(f"❌ المستخدم {new_admin_id} أدمن بالفعل.")
+            return
+        
+        admins.append(new_admin_id)
+        await DataManager.save_admins(admins)
+        
+        # Update user admin status
+        new_user.is_admin = True
+        await DataManager.save_user(new_user)
+        
+        await update.message.reply_text(f"✅ تم تعيين المستخدم {new_admin_id} كأدمن مساعد.")
+        
+        # Notify new admin
         try:
             await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text="❌ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى."
+                chat_id=new_admin_id,
+                text="🎉 <b>مبروك!</b>\n\n"
+                     "📢 تم تعيينك كأدمن مساعد في البوت.\n"
+                     "يمكنك الآن الوصول إلى لوحة الأدمن عبر الأمر /admin",
+                parse_mode=ParseMode.HTML
             )
         except:
             pass
+            
+    except ValueError:
+        await update.message.reply_text("❌ user_id يجب أن يكون رقماً.")
+
+async def set_balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set user balance via command /setbalance user_id amount"""
+    user_id = update.effective_user.id
+    
+    if not await is_super_admin(user_id):
+        await update.message.reply_text("❌ هذا الأمر للأدمن الرئيسي فقط.")
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ استخدام خاطئ.\n"
+            "استخدم: /setbalance user_id amount\n"
+            "مثال: /setbalance 123456789 100000"
+        )
+        return
+    
+    try:
+        target_user_id = int(context.args[0].strip())
+        amount = float(context.args[1].strip())
+        
+        target_user = await DataManager.get_user(target_user_id)
+        if not target_user:
+            await update.message.reply_text(f"❌ المستخدم {target_user_id} غير موجود.")
+            return
+        
+        target_user.balance = amount
+        await DataManager.save_user(target_user)
+        
+        await update.message.reply_text(
+            f"✅ تم تعديل رصيد المستخدم {target_user_id} إلى {amount:,.0f} ليرة."
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ user_id و amount يجب أن يكونا أرقاماً.")
 
 # ==================== MAIN FUNCTION ====================
 def main():
@@ -2510,122 +2746,71 @@ def main():
     # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversation handler for main flow
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            States.MAIN_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_handle_message),
-                CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"),
-                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$"),
-                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$"),
-                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$"),
-                CallbackQueryHandler(eshansy_delete_callback, pattern="^confirm_delete_eshansy$|^cancel_delete_eshansy$"),
-                CallbackQueryHandler(topup_method_callback, pattern="^topup_|^code_|^back$"),
-                CallbackQueryHandler(topup_confirm_callback, pattern="^confirm_topup$|^cancel_topup$"),
-                CallbackQueryHandler(withdraw_method_callback, pattern="^withdraw_"),
-                CallbackQueryHandler(withdraw_confirm_callback, pattern="^confirm_withdraw$|^cancel_withdraw$"),
-                CallbackQueryHandler(cancel_withdraw_callback, pattern="^cancel_req_|^keep_request$"),
-                CallbackQueryHandler(admin_show_requests_callback, pattern="^admin_show_|^admin_back$"),
-                CallbackQueryHandler(admin_request_action_callback, pattern="^approve_|^reject_|^edit_|^admin_nav_"),
-                CallbackQueryHandler(admin_backup_callback, pattern="^admin_backup$|^admin_restore$|^admin_delete_backups$|^admin_backup_restore$"),
-                CallbackQueryHandler(maintenance_callback, pattern="^maintenance_"),
-                CallbackQueryHandler(broadcast_confirm_callback, pattern="^confirm_broadcast$|^cancel_broadcast$"),
-                CallbackQueryHandler(admin_user_nav_callback, pattern="^user_nav_|^admin_back_search$"),
-                CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"),
-                CallbackQueryHandler(admin_back_requests_callback, pattern="^admin_back_requests$")
-            ],
-            States.ESHANSY_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_menu_handler),
-                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$"),
-                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$"),
-                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$"),
-                CallbackQueryHandler(eshansy_delete_callback, pattern="^confirm_delete_eshansy$|^cancel_delete_eshansy$")
-            ],
-            States.ESHANSY_CREATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_create_account_handler),
-                CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$")
-            ],
-            States.ESHANSY_TOPUP: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_topup_handler),
-                CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$")
-            ],
-            States.ESHANSY_WITHDRAW: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, eshansy_withdraw_handler),
-                CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$")
-            ],
-            States.TOPUP_METHOD: [
-                CallbackQueryHandler(topup_method_callback)
-            ],
-            States.TOPUP_SYRIA_REF: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, topup_ref_handler)
-            ],
-            States.TOPUP_SYRIA_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, topup_amount_handler)
-            ],
-            States.TOPUP_CONFIRM: [
-                CallbackQueryHandler(topup_confirm_callback)
-            ],
-            States.WITHDRAW_METHOD: [
-                CallbackQueryHandler(withdraw_method_callback)
-            ],
-            States.WITHDRAW_SYRIA_NUMBER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_number_handler)
-            ],
-            States.WITHDRAW_SYRIA_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount_handler)
-            ],
-            States.WITHDRAW_CONFIRM: [
-                CallbackQueryHandler(withdraw_confirm_callback)
-            ],
-            States.ADMIN_BROADCAST: [
-                MessageHandler(filters.ALL & ~filters.COMMAND, admin_broadcast_handler)
-            ],
-            States.ADMIN_BROADCAST_CONFIRM: [
-                CallbackQueryHandler(broadcast_confirm_callback)
-            ],
-            States.ADMIN_SEARCH_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_handler),
-                CallbackQueryHandler(admin_user_nav_callback)
-            ]
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            MessageHandler(filters.TEXT & filters.Regex("^🔙 رجوع$"), back_to_main)
-        ],
-        allow_reentry=True
-    )
-    
-    # Add handlers
-    application.add_handler(conv_handler)
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("addaccount", add_account_command))
+    application.add_handler(CommandHandler("addadmin", add_admin_command))
+    application.add_handler(CommandHandler("setbalance", set_balance_command))
+    
+    # Message handler for main menu
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        admin_handle_message
+    ))
+    
+    # Callback query handlers
+    application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
+    application.add_handler(CallbackQueryHandler(eshansy_confirm_callback, pattern="^confirm_eshansy$|^reject_eshansy$"))
+    application.add_handler(CallbackQueryHandler(eshansy_topup_confirm_callback, pattern="^confirm_eshansy_topup$|^cancel_eshansy_topup$"))
+    application.add_handler(CallbackQueryHandler(eshansy_withdraw_confirm_callback, pattern="^confirm_eshansy_withdraw$|^cancel_eshansy_withdraw$"))
+    application.add_handler(CallbackQueryHandler(eshansy_delete_callback, pattern="^confirm_delete_eshansy$|^cancel_delete_eshansy$"))
+    application.add_handler(CallbackQueryHandler(topup_method_callback, pattern="^topup_|^code_|^back_to_|^back_to_main$"))
+    application.add_handler(CallbackQueryHandler(topup_confirm_callback, pattern="^confirm_topup$|^cancel_topup$"))
+    application.add_handler(CallbackQueryHandler(withdraw_method_callback, pattern="^withdraw_|^back_to_main$"))
+    application.add_handler(CallbackQueryHandler(withdraw_confirm_callback, pattern="^confirm_withdraw$|^cancel_withdraw$"))
+    application.add_handler(CallbackQueryHandler(cancel_withdraw_callback, pattern="^cancel_req_|^keep_request$"))
+    application.add_handler(CallbackQueryHandler(admin_show_requests_callback, pattern="^admin_show_|^admin_back$|^back_to_pending$"))
+    application.add_handler(CallbackQueryHandler(admin_request_action_callback, pattern="^approve_|^reject_|^edit_|^admin_nav_|^noop$|^back_to_pending$"))
+    application.add_handler(CallbackQueryHandler(admin_backup_callback, pattern="^admin_backup$|^admin_restore$|^admin_delete_backups$|^admin_backup_restore$"))
+    application.add_handler(CallbackQueryHandler(maintenance_callback, pattern="^maintenance_"))
+    application.add_handler(CallbackQueryHandler(broadcast_confirm_callback, pattern="^confirm_broadcast$|^cancel_broadcast$"))
+    application.add_handler(CallbackQueryHandler(admin_user_nav_callback, pattern="^user_nav_|^admin_back_search$|^noop$"))
+    application.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
     
     # Error handler
     application.add_error_handler(error_handler)
     
+    # Initialize data files
+    async def init_files():
+        # Ensure all files exist
+        for file_path in [USERS_FILE, ACCOUNTS_FILE, PENDING_FILE, ADMINS_FILE, MAINTENANCE_FILE]:
+            if not await aiofiles.os.path.exists(file_path):
+                default_data = [] if file_path == ADMINS_FILE else {}
+                await save_data(file_path, default_data)
+        
+        # Create backup directory
+        BACKUP_DIR.mkdir(exist_ok=True)
+        
+        # Initialize super admin
+        if SUPER_ADMIN_ID:
+            user = await DataManager.get_user(SUPER_ADMIN_ID)
+            if not user:
+                user = UserData(SUPER_ADMIN_ID)
+                user.is_super_admin = True
+                user.is_admin = True
+                user.subscribed = True
+                await DataManager.save_user(user)
+                logger.info(f"Initialized super admin: {SUPER_ADMIN_ID}")
+    
+    # Run initialization
+    asyncio.run(init_files())
+    
     # Start the bot
     print("🤖 البوت يعمل...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-async def eshansy_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    
-    if text.startswith("📝 إنشاء / استلام حساب"):
-        return await eshansy_create_account(update, context)
-    elif text.startswith("💰 شحن حساب ايشانسي"):
-        return await eshansy_topup(update, context)
-    elif text.startswith("💸 سحب من حساب ايشانسي"):
-        return await eshansy_withdraw(update, context)
-    elif text.startswith("🗑️ حذف حساب ايشانسي"):
-        return await eshansy_delete(update, context)
-    elif text.startswith("🔙 رجوع"):
-        return await back_to_main(update, context)
-    else:
-        await update.message.reply_text(
-            "💼 اختر من قائمة ايشانسي:",
-            reply_markup=get_eshansy_keyboard()
-        )
-        return States.ESHANSY_MENU
+    print(f"👑 Super Admin ID: {SUPER_ADMIN_ID}")
+    print(f"📢 القناة المطلوبة: {REQUIRED_CHANNEL}")
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
