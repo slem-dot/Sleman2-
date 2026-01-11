@@ -1348,23 +1348,25 @@ def ensure_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
-def main() -> None:
-    # تأكيد وجود event loop (مهم جدًا مع Python 3.12)
-    ensure_event_loop()
+import asyncio
+from telegram import Update
 
-    # تهيئة التخزين والملفات (async)
-    asyncio.run(bootstrap())
+async def main() -> None:
+    # تهيئة التخزين
+    await bootstrap()
 
     # بناء التطبيق
     app = build_app()
 
     log.info("Starting bot (polling only)...")
 
-    # تشغيل البوت (بدون await)
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    # تشغيل التطبيق بطريقة صحيحة مع Python 3.12
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # إبقاء البوت شغّال
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
