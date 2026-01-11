@@ -1142,6 +1142,78 @@ async def stock_add_p(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await stock_stats(update, context)
     return S_ADMIN_ICH_STOCK
 
+
+async def stock_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Super admin: add multiple Ichancy accounts in one message.
+
+    Expected formats per line:
+      username,password
+      username:password
+    """
+    if not is_super(update.effective_user.id):
+        return ConversationHandler.END
+
+    raw = (update.message.text or "").strip()
+    if not raw:
+        await update.message.reply_text("⚠️ ابعت الحسابات برسالة واحدة (كل سطر حساب) 🙏")
+        return S_ADMIN_ICH_BULK
+
+    ich = await STORE.read(F_ICHANCY, DEFAULT_ICHANCY)
+    stock = ich.get("stock", []) or []
+
+    existing = { (a.get("username") or "").strip().lower() for a in stock if a.get("username") }
+
+    added = 0
+    skipped = 0
+    bad = 0
+
+    lines_in = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    for ln in lines_in:
+        if "," in ln:
+            u, p = [x.strip() for x in ln.split(",", 1)]
+        elif ":" in ln:
+            u, p = [x.strip() for x in ln.split(":", 1)]
+        else:
+            # allow 'user pass' as a convenience
+            parts = ln.split()
+            if len(parts) >= 2:
+                u, p = parts[0].strip(), " ".join(parts[1:]).strip()
+            else:
+                bad += 1
+                continue
+
+        if len(u) < 3 or len(p) < 3:
+            bad += 1
+            continue
+
+        key = u.lower()
+        if key in existing:
+            skipped += 1
+            continue
+
+        stock.append({
+            "id": gen_id("ACC"),
+            "username": u,
+            "password": p,
+            "status": "available",
+            "assigned_to": None,
+            "assigned_at": None,
+        })
+        existing.add(key)
+        added += 1
+
+    ich["stock"] = stock
+    await STORE.write(F_ICHANCY, ich)
+
+    await update.message.reply_text(
+        "✅ تمّت الإضافة بالجملة\n\n"
+        f"➕ تمت إضافة: {added}\n"
+        f"↩️ مكررة/موجودة: {skipped}\n"
+        f"⚠️ غير صالحة: {bad}",
+        reply_markup=mk_stock_menu(),
+    )
+    return S_ADMIN_ICH_STOCK
+
 async def stock_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = norm(update.message.text)
     ich = await STORE.read(F_ICHANCY, DEFAULT_ICHANCY)
