@@ -1338,12 +1338,11 @@ def build_app() -> Application:
     app.add_handler(conv, group=1)
     app.add_error_handler(on_error)
     return app
-
-async def main() -> None:
-    await bootstrap()
+def main() -> None:
+    asyncio.run(bootstrap())
     app = build_app()
     log.info("Starting bot (polling only)...")
-    await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
