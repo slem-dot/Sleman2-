@@ -46,9 +46,6 @@ SUPPORT_USERNAME = env_str("SUPPORT_USERNAME", "@support")
 DATA_DIR = env_str("DATA_DIR", "data")
 MIN_TOPUP = env_int("MIN_TOPUP", 15000)
 MIN_WITHDRAW = env_int("MIN_WITHDRAW", 500)
-REF_RATE = float(env_str("REF_RATE", "0.04") or "0.04")
-REF_MIN_ACTIVE = env_int("REF_MIN_ACTIVE", 3)
-REF_PERIOD_DAYS = env_int("REF_PERIOD_DAYS", 10)
 SYRIATEL_CODES = [c.strip() for c in env_str("SYRIATEL_CODES", "").split(",") if c.strip()]
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
 
@@ -127,7 +124,6 @@ F_ORDERS = "orders.json"
 F_ICHANCY = "ichancy_accounts.json"
 F_ADMINS = "admins.json"
 F_SETTINGS = "settings.json"
-F_REFS = "referrals.json"
 
 DEFAULT_USERS = {"users": {}}
 DEFAULT_WALLETS = {"wallets": {}}
@@ -135,141 +131,9 @@ DEFAULT_ORDERS = {"orders": []}
 DEFAULT_ICHANCY = {"stock": [], "assigned": {}}
 DEFAULT_ADMINS = {"assistants": []}
 DEFAULT_SETTINGS = {"maintenance": False}
-DEFAULT_REFS = {"period_start": "", "inviters": {}}
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-
-def iso_to_dt(iso: str) -> Optional[datetime]:
-    try:
-        if not iso:
-            return None
-        s = iso.strip()
-        if s.endswith("Z"):
-            s = s[:-1]
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-async def ref_get_data() -> Dict[str, Any]:
-    data = await STORE.read(F_REFS, DEFAULT_REFS)
-    if not data.get("period_start"):
-        data["period_start"] = now_iso()
-        await STORE.write(F_REFS, data)
-    ps = iso_to_dt(data.get("period_start", "")) or datetime.utcnow()
-    if (datetime.utcnow() - ps).days >= max(1, int(REF_PERIOD_DAYS)):
-        data["period_start"] = now_iso()
-        await STORE.write(F_REFS, data)
-    return data
-
-def ref_period_remaining_days(period_start_iso: str) -> int:
-    ps = iso_to_dt(period_start_iso) or datetime.utcnow()
-    elapsed = (datetime.utcnow() - ps).days
-    return max(0, int(REF_PERIOD_DAYS) - elapsed)
-
-def count_active_refs(inv: Dict[str, Any], period_start_iso: str) -> int:
-    ps = iso_to_dt(period_start_iso) or datetime.utcnow()
-    c = 0
-    for _, info in (inv.get("refs", {}) or {}).items():
-        la = iso_to_dt((info or {}).get("last_active_at", ""))
-        if la and la >= ps:
-            c += 1
-    return c
-
-async def bind_referral(new_user_id: int, inviter_id: int) -> None:
-    if inviter_id <= 0 or new_user_id == inviter_id:
-        return
-    users = await STORE.read(F_USERS, DEFAULT_USERS)
-    if str(inviter_id) not in users.get("users", {}):
-        return
-    nu = users["users"].get(str(new_user_id))
-    if not nu or nu.get("inviter_id"):
-        return
-    nu["inviter_id"] = inviter_id
-    nu["invited_at"] = now_iso()
-    await STORE.write(F_USERS, users)
-
-    refs = await ref_get_data()
-    inv = refs["inviters"].get(str(inviter_id)) or {"refs": {}, "pending": 0, "paid": 0}
-    inv["refs"].setdefault(str(new_user_id), {"joined_at": now_iso(), "last_active_at": ""})
-    refs["inviters"][str(inviter_id)] = inv
-    await STORE.write(F_REFS, refs)
-
-async def mark_ref_active(referred_user_id: int) -> None:
-    users = await STORE.read(F_USERS, DEFAULT_USERS)
-    ru = users.get("users", {}).get(str(referred_user_id)) or {}
-    inviter_id = ru.get("inviter_id")
-    if not inviter_id:
-        return
-    refs = await ref_get_data()
-    inv = refs.get("inviters", {}).get(str(inviter_id))
-    if not inv:
-        return
-    ref_entry = (inv.get("refs", {}) or {}).get(str(referred_user_id))
-    if not ref_entry:
-        return
-    ref_entry["last_active_at"] = now_iso()
-    inv["refs"][str(referred_user_id)] = ref_entry
-    refs["inviters"][str(inviter_id)] = inv
-    await STORE.write(F_REFS, refs)
-
-async def add_ref_commission_if_eligible(referred_user_id: int, amount: int) -> None:
-    if amount <= 0:
-        return
-    users = await STORE.read(F_USERS, DEFAULT_USERS)
-    ru = users.get("users", {}).get(str(referred_user_id)) or {}
-    inviter_id = ru.get("inviter_id")
-    if not inviter_id:
-        return
-
-    await mark_ref_active(referred_user_id)
-
-    refs = await ref_get_data()
-    inv = refs.get("inviters", {}).get(str(inviter_id)) or {"refs": {}, "pending": 0, "paid": 0}
-    active = count_active_refs(inv, refs.get("period_start", ""))
-    if active < int(REF_MIN_ACTIVE):
-        return
-
-    commission = int(amount * float(REF_RATE))
-    if commission <= 0:
-        return
-
-    inv["pending"] = int(inv.get("pending", 0)) + commission
-    refs["inviters"][str(inviter_id)] = inv
-    await STORE.write(F_REFS, refs)
-
-async def referral_message(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-    refs = await ref_get_data()
-    inv = refs.get("inviters", {}).get(str(user_id)) or {"refs": {}, "pending": 0, "paid": 0}
-    total = len((inv.get("refs") or {}))
-    active = count_active_refs(inv, refs.get("period_start", ""))
-    remain = ref_period_remaining_days(refs.get("period_start", ""))
-
-    bot_username = getattr(context.bot, "username", "") or ""
-    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else "(BOT_USERNAME غير متاح)"
-
-    lines = [
-        "🤝 <b>كن وكيلاً معنا بأبسط طريقة</b>",
-        "إحصل على نسبة ثابتة لكل عمليات الشحن والسحب القادمة عن طريق رابط إحالتك ضمن البوت ✅",
-        "",
-        "1- انسخ رابط إحالتك من هنا.",
-        "2- عند تسجيل شخص عبر رابطك سنحسب نسبة ثابتة لعمليات الشحن والسحب الخاصة به.",
-        f"3- يتم حساب الارباح عند وجود <b>{REF_MIN_ACTIVE}</b> إحالات نشطة او أكثر 🔥",
-        "",
-        f"🔗 <b>رابط الاحالة الخاص بك:</b>\n<code>{link}</code>",
-        "",
-        f"👥 <b>إجمالي الإحالات:</b> {total}",
-        f"✅ <b>الإحالات النشطة:</b> {active}",
-        "",
-        f"⏳ <b>مدة حساب الارباح:</b> {REF_PERIOD_DAYS} يوم/أيام",
-        f"🗓 <b>الأيام المتبقية على توزيع الارباح:</b> {remain} يوم/أيام",
-        "",
-        f"💰 <b>نسبة العمولة:</b> {int(float(REF_RATE)*100)}%",
-        f"📌 <b>أرباحك المعلّقة:</b> {int(inv.get('pending',0))} ل.س",
-        "ℹ️ يتم توزيع الأرباح يدويًا من الأدمن.",
-    ]
-    return "\n".join(lines)
 
 def safe_int(txt: str) -> Optional[int]:
     try:
@@ -295,16 +159,14 @@ def mk_main_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton("💼 حساب ايشانسي"), KeyboardButton("💰 محفظتي")],
         [KeyboardButton("➕ شحن رصيد البوت"), KeyboardButton("➖ سحب رصيد من البوت")],
         [KeyboardButton("🧾 إلغاء آخر طلب سحب"), KeyboardButton("🆘 دعم")],
-        [KeyboardButton("🤝 الوكالة / الإحالات")],
     ]
-    rows.append([KeyboardButton("🏠 القائمة الرئيسية")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def mk_ich_menu() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton("1️⃣ إنشاء / استلام حساب ايشانسي"), KeyboardButton("2️⃣ شحن حساب ايشانسي")],
         [KeyboardButton("3️⃣ سحب من حساب ايشانسي"), KeyboardButton("4️⃣ حذف حساب ايشانسي")],
-        [KeyboardButton("↩️ رجوع"), KeyboardButton("🏠 القائمة الرئيسية")],
+        [KeyboardButton("↩️ رجوع")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -314,7 +176,6 @@ def mk_admin_menu(super_admin: bool) -> ReplyKeyboardMarkup:
     ]
     if super_admin:
         rows.append([KeyboardButton("💰 تعديل رصيد"), KeyboardButton("📦 مخزون ايشانسي")])
-        rows.append([KeyboardButton("🤝 الإحالات")])
         rows.append([KeyboardButton("👥 تعيين أدمن مساعد"), KeyboardButton("📢 رسالة جماعية")])
         rows.append([KeyboardButton("💾 Backup"), KeyboardButton("♻️ Restore")])
         rows.append([KeyboardButton("🛠 صيانة"), KeyboardButton("↩️ رجوع")])
@@ -329,7 +190,6 @@ async def bootstrap() -> None:
     await STORE.ensure(F_ICHANCY, DEFAULT_ICHANCY)
     await STORE.ensure(F_ADMINS, DEFAULT_ADMINS)
     await STORE.ensure(F_SETTINGS, DEFAULT_SETTINGS)
-    await STORE.ensure(F_REFS, DEFAULT_REFS)
 
 async def ensure_user(update: Update) -> None:
     u = update.effective_user
@@ -483,28 +343,25 @@ def order_text(o: Dict[str, Any]) -> str:
     S_ADMIN_MENU, S_ADMIN_SEARCH, S_ADMIN_SETBAL_UID, S_ADMIN_SETBAL_AMT,
     S_ADMIN_ASSIST, S_ADMIN_BROADCAST, S_ADMIN_RESTORE, S_ADMIN_ICH_STOCK,
     S_ADMIN_ICH_ADD_U, S_ADMIN_ICH_ADD_P, S_ADMIN_ICH_DEL_Q,
-    S_ADMIN_REF_MENU,
-    S_ADMIN_ICH_BULK,
-) = range(29)
+) = range(27)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gate_maintenance(update, context):
         return ConversationHandler.END
     await ensure_user(update)
-    try:
-        args = getattr(context, "args", []) or []
-        if args and update.effective_user:
-            a0 = str(args[0]).strip()
-            if a0.startswith("ref_"):
-                a0 = a0[4:]
-            inv_id = safe_int(a0)
-            if inv_id and inv_id != update.effective_user.id:
-                await bind_referral(update.effective_user.id, inv_id)
-    except Exception:
-        pass
     if not await require_sub(update, context):
         return ConversationHandler.END
-    await update.message.reply_text("أهلًا فيك 👋\nاختر من القائمة 👇", reply_markup=mk_main_menu())
+    u = update.effective_user
+    if u and await is_admin(u.id):
+        await update.message.reply_text(
+            "👮‍♂️ أهلاً أدمن 👋
+هاي لوحة التحكم الخاصة فيك 👇",
+            reply_markup=mk_admin_menu(is_super(u.id)),
+        )
+        return S_ADMIN_MENU
+
+    await update.message.reply_text("أهلًا فيك 👋
+اختر من القائمة 👇", reply_markup=mk_main_menu())
     return S_MAIN
 
 async def cb_checksub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -521,12 +378,16 @@ async def cb_checksub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         m = await context.bot.get_chat_member(REQUIRED_CHANNEL, u.id)
         st = getattr(m, "status", "")
         if st in ("member", "administrator", "creator"):
+            u = update.effective_user
+            if u and await is_admin(u.id):
+                await q.message.reply_text("✅ تم التحقق! 👮‍♂️ أهلاً أدمن.", reply_markup=mk_admin_menu(is_super(u.id)))
+                return S_ADMIN_MENU
             await q.message.reply_text("✅ تم التحقق! أهلاً فيك 😄", reply_markup=mk_main_menu())
             return S_MAIN
     except Exception:
         if await is_admin(u.id):
-            await q.message.reply_text("✅ تم السماح (صلاحيات أدمن).", reply_markup=mk_main_menu())
-            return S_MAIN
+            await q.message.reply_text("✅ تم السماح 👮‍♂️ (صلاحيات أدمن).", reply_markup=mk_admin_menu(is_super(u.id)))
+            return S_ADMIN_MENU
     join_url = f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ اشترك بالقناة", url=join_url)],
@@ -806,7 +667,6 @@ async def cancel_last_withdraw(update: Update, context: ContextTypes.DEFAULT_TYP
     return S_MAIN
 
 async def ich_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["last_menu"] = "ich"
     if not await gate_maintenance(update, context):
         return ConversationHandler.END
     await ensure_user(update)
@@ -1061,18 +921,7 @@ async def admin_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-
-def mk_stock_menu() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton("➕ إضافة حساب"), KeyboardButton("➕ إضافة بالجملة")],
-        [KeyboardButton("🗑 حذف حساب"), KeyboardButton("📊 إحصائيات")],
-        [KeyboardButton("↩️ رجوع"), KeyboardButton("🏠 القائمة الرئيسية")],
-    ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-
 async def stock_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["last_menu"] = "stock"
     ich = await STORE.read(F_ICHANCY, DEFAULT_ICHANCY)
     stock = ich.get("stock", []) or []
     av = sum(1 for a in stock if (a.get("status") or "available") == "available")
@@ -1080,38 +929,29 @@ async def stock_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "📦 مخزون ايشانسي\n\n"
         f"✅ متاح: <b>{av}</b>\n"
-        f"🔒 محجوز: <b>{asg}</b>\n",
+        f"🔒 محجوز: <b>{asg}</b>\n\n"
+        "اكتب:\nadd\n del\n stats\n back",
         parse_mode=ParseMode.HTML,
-        reply_markup=mk_stock_menu()
+        reply_markup=ReplyKeyboardRemove()
     )
 
 async def stock_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_super(update.effective_user.id):
         return ConversationHandler.END
-    txt = norm(update.message.text)
-    if txt.startswith("🏠"):
-        return await go_home(update, context)
-    if txt.startswith("↩"):
+    t = norm(update.message.text).lower()
+    if t.startswith("back"):
         await update.message.reply_text("👑 لوحة الأدمن", reply_markup=mk_admin_menu(True))
         return S_ADMIN_MENU
-    if txt.startswith("📊"):
+    if t.startswith("stats"):
         await stock_stats(update, context)
         return S_ADMIN_ICH_STOCK
-    if txt.startswith("➕ إضافة بالجملة"):
-        await update.message.reply_text(
-            "➕ ابعت الحسابات بالجملة (كل سطر حساب):\n<code>username,password</code> أو <code>username:password</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return S_ADMIN_ICH_BULK
-    if txt.startswith("➕"):
+    if t.startswith("add"):
         await update.message.reply_text("👤 ابعت username:", reply_markup=ReplyKeyboardRemove())
         return S_ADMIN_ICH_ADD_U
-    if txt.startswith("🗑"):
+    if t.startswith("del"):
         await update.message.reply_text("🗑 ابعت username للحذف:", reply_markup=ReplyKeyboardRemove())
         return S_ADMIN_ICH_DEL_Q
-
-    await update.message.reply_text("اختار من القائمة 👇", reply_markup=mk_stock_menu())
+    await update.message.reply_text("اكتب add أو del أو stats أو back")
     return S_ADMIN_ICH_STOCK
 
 async def stock_add_u(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1142,78 +982,6 @@ async def stock_add_p(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await stock_stats(update, context)
     return S_ADMIN_ICH_STOCK
 
-
-async def stock_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Super admin: add multiple Ichancy accounts in one message.
-
-    Expected formats per line:
-      username,password
-      username:password
-    """
-    if not is_super(update.effective_user.id):
-        return ConversationHandler.END
-
-    raw = (update.message.text or "").strip()
-    if not raw:
-        await update.message.reply_text("⚠️ ابعت الحسابات برسالة واحدة (كل سطر حساب) 🙏")
-        return S_ADMIN_ICH_BULK
-
-    ich = await STORE.read(F_ICHANCY, DEFAULT_ICHANCY)
-    stock = ich.get("stock", []) or []
-
-    existing = { (a.get("username") or "").strip().lower() for a in stock if a.get("username") }
-
-    added = 0
-    skipped = 0
-    bad = 0
-
-    lines_in = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    for ln in lines_in:
-        if "," in ln:
-            u, p = [x.strip() for x in ln.split(",", 1)]
-        elif ":" in ln:
-            u, p = [x.strip() for x in ln.split(":", 1)]
-        else:
-            # allow 'user pass' as a convenience
-            parts = ln.split()
-            if len(parts) >= 2:
-                u, p = parts[0].strip(), " ".join(parts[1:]).strip()
-            else:
-                bad += 1
-                continue
-
-        if len(u) < 3 or len(p) < 3:
-            bad += 1
-            continue
-
-        key = u.lower()
-        if key in existing:
-            skipped += 1
-            continue
-
-        stock.append({
-            "id": gen_id("ACC"),
-            "username": u,
-            "password": p,
-            "status": "available",
-            "assigned_to": None,
-            "assigned_at": None,
-        })
-        existing.add(key)
-        added += 1
-
-    ich["stock"] = stock
-    await STORE.write(F_ICHANCY, ich)
-
-    await update.message.reply_text(
-        "✅ تمّت الإضافة بالجملة\n\n"
-        f"➕ تمت إضافة: {added}\n"
-        f"↩️ مكررة/موجودة: {skipped}\n"
-        f"⚠️ غير صالحة: {bad}",
-        reply_markup=mk_stock_menu(),
-    )
-    return S_ADMIN_ICH_STOCK
-
 async def stock_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = norm(update.message.text)
     ich = await STORE.read(F_ICHANCY, DEFAULT_ICHANCY)
@@ -1238,15 +1006,10 @@ async def stock_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return S_ADMIN_ICH_STOCK
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["last_menu"] = "admin"
     uid = update.effective_user.id
     if not await is_admin(uid):
         return ConversationHandler.END
     text = norm(update.message.text)
-    if text.startswith("🏠"):
-        return await go_home(update, context)
-    if text.startswith("🤝") and is_super(uid):
-        return await admin_referrals_entry(update, context)
     action = startswith_map(text, {"📌":"pending","🔎":"search","💰":"setbal","📦":"stock","👥":"assist","📢":"broadcast","💾":"backup","♻":"restore","🛠":"maint","↩":"back"}) or ""
     if action == "back":
         await update.message.reply_text("رجعناك للقائمة الرئيسية 👇", reply_markup=mk_main_menu())
@@ -1312,80 +1075,6 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if action == "":
         await update.message.reply_text("اختر من لوحة الأدمن 👇", reply_markup=mk_admin_menu(is_super(uid)))
     return S_ADMIN_MENU
-
-
-async def admin_referrals_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await gate_maintenance(update, context):
-        return ConversationHandler.END
-    if not is_super(update.effective_user.id):
-        await update.message.reply_text("⛔ غير مسموح.", reply_markup=mk_admin_menu(False))
-        return S_ADMIN_MENU
-    msg = ["🤝 <b>إدارة الإحالات</b>", "", "استخدم الأوامر التالية:", "<code>show USER_ID</code>", "<code>pay USER_ID AMOUNT</code>", "", "↩️ للرجوع: back"]
-    await update.message.reply_text("\n".join(msg), parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardMarkup([[KeyboardButton("↩️ رجوع"), KeyboardButton("🏠 القائمة الرئيسية")]], resize_keyboard=True))
-    return S_ADMIN_REF_MENU
-
-async def admin_referrals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_super(update.effective_user.id):
-        await update.message.reply_text("⛔ غير مسموح.", reply_markup=mk_admin_menu(False))
-        return S_ADMIN_MENU
-    txt = norm(update.message.text)
-    if txt.startswith("🏠"):
-        return await go_home(update, context)
-    if txt.startswith("↩") or txt.lower().startswith("back"):
-        await update.message.reply_text("👑 لوحة الأدمن", reply_markup=mk_admin_menu(True))
-        return S_ADMIN_MENU
-    parts = txt.split()
-    if not parts:
-        return S_ADMIN_REF_MENU
-    cmd = parts[0].lower()
-    if cmd == "show" and len(parts) >= 2:
-        uid = safe_int(parts[1])
-        if not uid:
-            await update.message.reply_text("اكتب USER_ID صحيح.")
-            return S_ADMIN_REF_MENU
-        refs = await ref_get_data()
-        inv = (refs.get("inviters", {}) or {}).get(str(uid)) or {"refs": {}, "pending": 0, "paid": 0}
-        total = len(inv.get("refs", {}) or {})
-        active = count_active_refs(inv, refs.get("period_start",""))
-        pending = int(inv.get("pending", 0))
-        paid = int(inv.get("paid", 0))
-        remain = ref_period_remaining_days(refs.get("period_start",""))
-        await update.message.reply_text(
-            "👤 <b>تقرير وكيل</b>\n"
-            f"ID: <code>{uid}</code>\n\n"
-            f"👥 إجمالي الإحالات: <b>{total}</b>\n"
-            f"✅ الإحالات النشطة: <b>{active}</b>\n"
-            f"💰 الأرباح المعلّقة: <b>{pending}</b>\n"
-            f"✅ تم صرفه سابقًا: <b>{paid}</b>\n\n"
-            f"🗓 الأيام المتبقية للدورة: <b>{remain}</b>",
-            parse_mode=ParseMode.HTML
-        )
-        return S_ADMIN_REF_MENU
-    if cmd == "pay" and len(parts) >= 3:
-        uid = safe_int(parts[1])
-        amt = safe_int(parts[2])
-        if not uid or not amt or amt <= 0:
-            await update.message.reply_text("الصيغة الصحيحة: pay USER_ID AMOUNT")
-            return S_ADMIN_REF_MENU
-        refs = await ref_get_data()
-        invs = refs.get("inviters", {}) or {}
-        inv = invs.get(str(uid))
-        if not inv:
-            await update.message.reply_text("هذا الوكيل غير موجود.")
-            return S_ADMIN_REF_MENU
-        pending = int(inv.get("pending", 0))
-        if amt > pending:
-            await update.message.reply_text(f"المبلغ أكبر من المعلّق ({pending}).")
-            return S_ADMIN_REF_MENU
-        inv["pending"] = pending - amt
-        inv["paid"] = int(inv.get("paid", 0)) + amt
-        invs[str(uid)] = inv
-        refs["inviters"] = invs
-        await STORE.write(F_REFS, refs)
-        await update.message.reply_text("✅ تم تسجيل التوزيع يدويًا.")
-        return S_ADMIN_REF_MENU
-    await update.message.reply_text("استخدم: show / pay / back")
-    return S_ADMIN_REF_MENU
 
 async def admin_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
@@ -1487,11 +1176,9 @@ async def apply_approve(o: Dict[str, Any]) -> None:
     if t == "topup":
         amt = int(data.get("amount", 0))
         await add_wallet(uid, db=+amt, dh=0)
-        await add_ref_commission_if_eligible(uid, amt)
     elif t == "withdraw":
         amt = int(data.get("amount", 0))
         await add_wallet(uid, db=0, dh=-amt)
-        await add_ref_commission_if_eligible(uid, amt)
 
 async def apply_reject(o: Dict[str, Any]) -> None:
     if o.get("type") == "withdraw":
@@ -1590,50 +1277,14 @@ async def main_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if not await require_sub(update, context):
         return ConversationHandler.END
     txt = norm(update.message.text)
-    act = startswith_map(txt, {"💼":"ich","💰":"wallet","➕":"topup","➖":"withdraw","🧾":"cancelwd","🆘":"support","🤝":"ref"})
+    act = startswith_map(txt, {"💼":"ich","💰":"wallet","➕":"topup","➖":"withdraw","🧾":"cancelwd","🆘":"support"})
     if act == "wallet": return await show_wallet(update, context)
     if act == "topup": return await topup_entry(update, context)
     if act == "withdraw": return await withdraw_entry(update, context)
     if act == "cancelwd": return await cancel_last_withdraw(update, context)
     if act == "support": return await support(update, context)
     if act == "ich": return await ich_entry(update, context)
-    if act == "ref": return await referral_entry(update, context)
     await update.message.reply_text("اختار من القائمة 👇", reply_markup=mk_main_menu())
-    return S_MAIN
-
-
-def _clear_flow_context(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for k in ("topup","wd","ich_suggest","edit_oid","setbal_uid","stock_u","broadcast"):
-        context.user_data.pop(k, None)
-
-async def go_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    _clear_flow_context(context)
-    await update.message.reply_text("🏠 رجعناك للقائمة الرئيسية 👇", reply_markup=mk_main_menu())
-    return S_MAIN
-
-async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    _clear_flow_context(context)
-    lm = context.user_data.get("last_menu", "main")
-    if lm == "admin":
-        await update.message.reply_text("👑 لوحة الأدمن", reply_markup=mk_admin_menu(is_super(update.effective_user.id)))
-        return S_ADMIN_MENU
-    if lm == "stock":
-        await update.message.reply_text("📦 مخزون ايشانسي", reply_markup=mk_stock_menu())
-        return S_ADMIN_ICH_STOCK
-    if lm == "ich":
-        await update.message.reply_text("💼 حساب ايشانسي", reply_markup=mk_ich_menu())
-        return S_ICH_MENU
-    await update.message.reply_text("↩️ تم الرجوع 👇", reply_markup=mk_main_menu())
-    return S_MAIN
-
-async def referral_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not await gate_maintenance(update, context):
-        return ConversationHandler.END
-    await ensure_user(update)
-    if not await require_sub(update, context):
-        return ConversationHandler.END
-    msg = await referral_message(context, update.effective_user.id)
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=mk_main_menu())
     return S_MAIN
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1691,13 +1342,13 @@ def build_app() -> Application:
             S_ADMIN_ICH_ADD_U: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_add_u)],
             S_ADMIN_ICH_ADD_P: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_add_p)],
             S_ADMIN_ICH_DEL_Q: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_del)],
-            S_ADMIN_REF_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_referrals_cmd)],
-            S_ADMIN_ICH_BULK: [MessageHandler(filters.TEXT & ~filters.COMMAND, stock_bulk_add)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^↩️"), go_back), MessageHandler(filters.Regex(r"^🏠"), go_home)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("admin", admin_cmd), CommandHandler("start", start)],
         name="conv",
         persistent=False,
     )
+    app.add_handler(CommandHandler("start", start), group=0)
+    app.add_handler(CommandHandler("admin", admin_cmd), group=0)
     app.add_handler(CallbackQueryHandler(admin_order_cb, pattern=r"^adm:(approve|reject|edit):.+$"), group=0)
     app.add_handler(CallbackQueryHandler(cb_checksub, pattern=r"^sys:checksub$"), group=0)
     app.add_handler(conv, group=1)
