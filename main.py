@@ -354,9 +354,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     u = update.effective_user
     if u and await is_admin(u.id):
         await update.message.reply_text(
-            "👮‍♂️ أهلاً أدمن 👋
-هاي لوحة التحكم الخاصة فيك 👇",
-            reply_markup=mk_admin_menu(is_super(u.id)),
+    """👮‍♂️ أهلاً أدمن 👋
+مرحباً بك في لوحة التحكم
+اختر العملية التي تريد تنفيذها 👇""",
+    reply_markup=mk_admin_menu(is_super(update.effective_user.id))
         )
         return S_ADMIN_MENU
 
