@@ -361,10 +361,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return S_ADMIN_MENU
 
-    await update.message.reply_text("أهلًا فيك 👋
-اختر من القائمة 👇", reply_markup=mk_main_menu())
-    return S_MAIN
-
+    await update.message.reply_text(
+    """أهلًا فيك 👋
+اختر من القائمة 👇"""
+)
 async def cb_checksub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gate_maintenance(update, context):
         return ConversationHandler.END
